@@ -1,0 +1,17 @@
+{
+  "scenario": "demo-root-run",
+  "runtime": "fake",
+  "sessions": [
+    {
+      "id": "fake-demo-root-session",
+      "turns": [
+        {
+          "id": "fake-demo-turn-1",
+          "input": "Inspect the repository and propose a safe patch plan.",
+          "output": "Fake response: repository inspected; plan is ready.",
+          "events": ["session.created", "turn.started", "message.delta", "message.completed"]
+        }
+      ]
+    }
+  ]
+}

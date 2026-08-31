@@ -1,0 +1,31 @@
+{
+  "name": "@dhole-control/node",
+  "version": "0.1.0",
+  "license": "AGPL-3.0-or-later",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "dhole-node": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
+    "dev": "node --enable-source-maps --watch dist/index.js",
+    "lint": "tsc -p tsconfig.json --noEmit",
+    "start": "node --enable-source-maps dist/index.js",
+    "test": "vitest",
+    "test:run": "vitest run --passWithNoTests",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@dhole-control/shared": "workspace:*",
+    "ws": "8.21.3",
+    "zod": "4.5.4"
+  },
+  "devDependencies": {
+    "@types/node": "24.10.0",
+    "@types/ws": "8.18.1",
+    "typescript": "7.0.2",
+    "vitest": "4.1.11"
+  }
+}

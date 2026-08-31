@@ -1,0 +1,26 @@
+{
+  "name": "@dhole-control/workspace",
+  "version": "0.1.0",
+  "license": "AGPL-3.0-or-later",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.29.2",
+  "engines": {
+    "node": ">=24.15 <25",
+    "pnpm": ">=10 <11"
+  },
+  "scripts": {
+    "build": "pnpm -r clean && pnpm -r build",
+    "clean": "pnpm -r clean",
+    "dev": "node scripts/dev.mjs",
+    "demo": "node scripts/demo.mjs",
+    "format:check": "node scripts/format-check.mjs",
+    "lint": "pnpm --filter @dhole-control/shared build && pnpm -r lint",
+    "test": "pnpm --filter @dhole-control/shared build && pnpm -r test",
+    "test:run": "pnpm --filter @dhole-control/shared build && pnpm -r test:run",
+    "typecheck": "pnpm --filter @dhole-control/shared build && pnpm -r typecheck",
+    "smoke:runtime": "node scripts/runtime-path-smoke.mjs",
+    "smoke:session": "node scripts/session-runtime-smoke.mjs",
+    "verify": "pnpm format:check && pnpm lint && pnpm typecheck && pnpm test:run && pnpm build && pnpm smoke:runtime && pnpm smoke:session"
+  }
+}

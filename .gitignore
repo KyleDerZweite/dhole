@@ -1,0 +1,13 @@
+node_modules/
+dist/
+.svelte-kit/
+.vite/
+coverage/
+data/
+*.db
+*.db-shm
+*.db-wal
+*.log
+.env
+.mediation.json
+.DS_Store

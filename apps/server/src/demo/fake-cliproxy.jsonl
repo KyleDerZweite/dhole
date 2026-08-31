@@ -1,0 +1,3 @@
+{"id":"fixture-req-001","provider":"openai","model":"gpt-4o-mini","endpoint":"/v1/chat/completions","status":200,"usage":{"inputTokens":128,"outputTokens":64,"cachedTokens":32},"latencyMs":418}
+{"id":"fixture-req-002","provider":"anthropic","model":"claude-3-5-sonnet","endpoint":"/v1/messages","status":429,"error":{"category":"rate_limit","summary":"fixture quota exhausted"},"latencyMs":92}
+{"id":"fixture-req-003","provider":"kimi","model":"kimi-k2","endpoint":"/v1/chat/completions","status":200,"usage":{"inputTokens":96,"outputTokens":41},"latencyMs":302}
