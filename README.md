@@ -85,8 +85,8 @@ load a `.env` file by itself). The most important server settings are:
 - `DHOLE_HOST`, `DHOLE_PORT`, `DHOLE_DATABASE`
 - `DHOLE_PUBLIC_ORIGIN` and `DHOLE_ALLOWED_HOSTS` (the browser origin and Host
   header allowlist)
-- `DHOLE_SOURCE_URL` (required in production; the public, version-matched
-  corresponding-source URL used by the AGPL source link)
+- `DHOLE_SOURCE_URL` (optional public source-code URL for forks or versioned
+  deployments; defaults to the Dhole GitHub repository)
 - `DHOLE_GATEWAY_ALLOWED_HOSTS` (administrator-configured Gateway destinations)
 - `DHOLE_MASTER_KEY_ID` and `DHOLE_MASTER_KEYS` (required in production; a JSON
   object of base64-encoded 32-byte AES-GCM keys)

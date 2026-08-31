@@ -609,7 +609,7 @@
         </form>
         <button class="link-button" type="button" onclick={() => { showBootstrap = false; error = ''; }}>Back to sign in</button>
       {/if}
-      <footer class="legal-notice"><span>© 2026 Kyle Der Zweite and contributors. No warranty.</span><span>Licensed under GNU AGPL v3 or later. <a href="/LICENSE" target="_blank" rel="noreferrer">View the AGPL text</a>; <a href="/source" target="_blank" rel="noreferrer">corresponding source for this installation</a>.</span></footer>
+      <footer class="legal-notice"><span>© 2026 Kyle Der Zweite and contributors. No warranty.</span><span>Licensed under the <a href="/LICENSE" target="_blank" rel="noreferrer">MIT License</a>; <a href="/source" target="_blank" rel="noreferrer">view source code</a>.</span></footer>
     </section>
   </main>
 {:else}
@@ -685,7 +685,7 @@
         {:else if route.kind === 'admin'}
           <section class="page-heading"><div><span class="eyebrow">ADMINISTRATION</span><h1>Keep the control plane legible.</h1><p class="muted">Users, nodes, providers, and security boundaries.</p></div><button bind:this={createUserTrigger} class="primary compact" type="button" onclick={openCreateUser}>＋ User</button></section><div class="detail-grid"><section class="panel wide"><header class="panel-header"><div><span class="eyebrow">IDENTITIES</span><h2>Users</h2></div></header>{#await api.users() then users}<div class="table-list">{#each users as item}<div class="table-row static"><span class="avatar">{item.displayName.slice(0, 1).toUpperCase()}</span><span><strong>{item.displayName}</strong><small>{item.email}</small></span><span class="status-pill">{titleCase(item.role)}</span></div>{/each}</div>{:catch}<p class="muted">User list unavailable.</p>{/await}</section><section class="panel"><header class="panel-header"><div><span class="eyebrow">FLEET</span><h2>Nodes</h2></div><span class="count-badge neutral">{machines.length}</span></header>{#if machines.length === 0}<p class="muted">No execution nodes enrolled.</p>{:else}{#each machines as item}<div class="capacity-row"><span class={`status-dot ${field(item, 'status') === 'connected' ? 'live' : 'danger'}`}></span><span><strong>{String(field(item, 'name') ?? field(item, 'id'))}</strong><small>{titleCase(field(item, 'status'))} · heartbeat {date(field(item, 'lastHeartbeatAt') ?? field(item, 'last_heartbeat_at'))}</small></span></div>{/each}{/if}</section></div>
         {/if}
-        <footer class="legal-notice app-legal"><span>© 2026 Kyle Der Zweite and contributors. No warranty.</span><span>GNU AGPL v3 or later · <a href="/LICENSE" target="_blank" rel="noreferrer">view license text</a> · <a href="/source" target="_blank" rel="noreferrer">corresponding source for this installation</a></span></footer>
+        <footer class="legal-notice app-legal"><span>© 2026 Kyle Der Zweite and contributors. No warranty.</span><span><a href="/LICENSE" target="_blank" rel="noreferrer">MIT License</a> · <a href="/source" target="_blank" rel="noreferrer">source code</a></span></footer>
       </main>
     </div>
   </div>

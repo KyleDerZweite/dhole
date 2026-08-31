@@ -98,7 +98,7 @@ describe('integrated application', () => {
     expect(response.status).toBe(401);
   });
 
-  it('serves the license notices and redirects to the corresponding source', async () => {
+  it('serves the license notices and redirects to the source code', async () => {
     const application = createApplication({ config: config(), seed: false });
     applications.push(application);
     const headers = { host: '127.0.0.1' };
@@ -109,7 +109,7 @@ describe('integrated application', () => {
 
     const license = await application.app.request('http://127.0.0.1:4173/LICENSE', { headers });
     expect(license.status).toBe(200);
-    expect(await license.text()).toContain('GNU AFFERO GENERAL PUBLIC LICENSE');
+    expect(await license.text()).toContain('MIT License');
 
     const notices = await application.app.request('http://127.0.0.1:4173/THIRD_PARTY_NOTICES.md', { headers });
     expect(notices.status).toBe(200);

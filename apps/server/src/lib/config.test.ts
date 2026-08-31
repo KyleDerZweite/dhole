@@ -30,10 +30,10 @@ describe('server configuration', () => {
     expect(config.publicOrigin.protocol).toBe('http:');
   });
 
-  it('requires an explicit HTTPS corresponding-source URL in production', () => {
+  it('keeps the source-code URL optional and HTTPS in production', () => {
     const missing = productionEnvironment('https://dhole.example');
     delete missing.DHOLE_SOURCE_URL;
-    expect(() => loadConfig(missing)).toThrow(/DHOLE_SOURCE_URL/);
+    expect(loadConfig(missing).sourceUrl).toBeUndefined();
     expect(() => loadConfig({ ...productionEnvironment('https://dhole.example'), DHOLE_SOURCE_URL: 'http://example.test/source' })).toThrow(/DHOLE_SOURCE_URL/);
   });
 

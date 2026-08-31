@@ -60,8 +60,8 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): AppCon
   if (raw.NODE_ENV === 'production' && publicOrigin.protocol !== 'https:') {
     throw new Error('Production requires an HTTPS DHOLE_PUBLIC_ORIGIN');
   }
-  if (raw.NODE_ENV === 'production' && (!sourceUrl || sourceUrl.protocol !== 'https:')) {
-    throw new Error('Production requires an HTTPS DHOLE_SOURCE_URL for corresponding source');
+  if (raw.NODE_ENV === 'production' && sourceUrl && sourceUrl.protocol !== 'https:') {
+    throw new Error('Production DHOLE_SOURCE_URL must use HTTPS');
   }
   return {
     environment: raw.NODE_ENV,

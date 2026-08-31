@@ -51,6 +51,7 @@ Use a deployment-owned environment (or secret manager) rather than committing
 ```sh
 export NODE_ENV=production
 export DHOLE_PUBLIC_ORIGIN='https://dhole.example'
+# Optional for forks or versioned deployments; /source otherwise links to Dhole's repository.
 export DHOLE_SOURCE_URL='https://github.com/your-org/dhole/tree/v0.1.0'
 export DHOLE_ALLOWED_HOSTS='dhole.example'
 export DHOLE_MASTER_KEY_ID='v1'

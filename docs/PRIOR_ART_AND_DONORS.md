@@ -30,6 +30,6 @@ If a future change imports or adapts code, examples, images, or documentation, u
 - The Mediation repository's `package.json` declares MIT, but the repository had no `LICENSE` file at the reviewed revision. Treat that as an unresolved provenance risk: obtain and preserve an authoritative license file before adapting Mediation source, and record the exact commit and copyright holders.
 - The MCP repository is in a licensing transition: its `LICENSE` says new code and specification contributions are Apache-2.0, documentation other than specifications is CC-BY-4.0, and authors who have not consented to relicensing remain under MIT. Determine the per-file license before redistributing any MCP material.
 - Agent Skills states that repository code is Apache-2.0 and documentation is CC-BY-4.0, with individual directories potentially carrying additional terms. Attribute and preserve notices for any copied example or document; the current Dhole implementation copies none.
-- Dhole itself is licensed under AGPL-3.0-or-later. Third-party MIT, Apache-2.0, and CC-BY-4.0 material remains under its own terms; this file does not relicense donor works.
+- Dhole itself is licensed under MIT. Third-party MIT, Apache-2.0, and CC-BY-4.0 material remains under its own terms; this file does not relicense donor works.
 
 Research sources can change. Release reviews should re-check the pinned upstream revisions, regenerate the dependency inventory, and resolve all entries marked as conditional or unresolved before distributing a bundle.

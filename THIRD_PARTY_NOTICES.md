@@ -1,6 +1,6 @@
 # Dhole third-party notices
 
-Dhole is distributed under the GNU Affero General Public License, version 3 or any later version; see [`LICENSE`](LICENSE). This notice records the direct dependencies in the workspace manifests and the public projects/specifications reviewed as prior art. It is not a complete transitive software bill of materials. Versions and license metadata were checked on 2026-08-30; update this file with every dependency or source revision change.
+Dhole is distributed under the MIT License; see [`LICENSE`](LICENSE). This notice records the direct dependencies in the workspace manifests and the public projects/specifications reviewed as prior art. It is not a complete transitive software bill of materials. Versions and license metadata were checked on 2026-08-30; update this file with every dependency or source revision change.
 
 The workspace packages (`@dhole-control/server`, `@dhole-control/node`, `@dhole-control/web`, and `@dhole-control/shared`) are first-party code and are not listed as third-party components. The tables below use the license and copyright notices shipped by each package; links point to the corresponding upstream source.
 
