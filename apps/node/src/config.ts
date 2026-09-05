@@ -1,4 +1,4 @@
-import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, writeSync, fsyncSync } from 'node:fs';
+import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, writeSync, fsyncSync, unlinkSync } from 'node:fs';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { randomUUID } from 'node:crypto';
@@ -39,14 +39,29 @@ export interface NodeConfig {
   secrets: ReadonlyMap<string, string>;
 }
 
-export interface CredentialState {
-  machineId: string;
-  credential: string;
-  updatedAt?: string;
+const CredentialStateSchema = z.object({
+  machineId: z.string().min(1).max(160), credential: z.string().min(1).max(512), updatedAt: z.iso.datetime().optional(),
+});
+export type CredentialState = z.infer<typeof CredentialStateSchema>;
+
+const ConnectionSchema = z.object({
+  serverUrl: z.string().max(2048),
+  repositories: z.record(z.string().min(1).max(160), z.string().min(1).max(4096)).default({}),
+});
+
+export function readConnectionState(stateDir: string): z.infer<typeof ConnectionSchema> | undefined {
+  const path = join(stateDir, 'connection.json');
+  if (!existsSync(path)) return undefined;
+  return ConnectionSchema.parse(JSON.parse(readFileSync(path, 'utf8')) as unknown);
 }
 
 export function loadNodeConfig(environment: NodeJS.ProcessEnv = process.env): NodeConfig {
-  const raw = EnvironmentSchema.parse(environment);
+  const stateDir = resolve(environment.DHOLE_NODE_STATE_DIR ?? join(homedir(), '.dhole-node'));
+  const connected = readConnectionState(stateDir);
+  const raw = EnvironmentSchema.parse({
+    ...(connected ? { DHOLE_NODE_SERVER_URL: connected.serverUrl, DHOLE_NODE_REPOSITORIES: JSON.stringify(connected.repositories) } : {}),
+    ...environment,
+  });
   const serverUrl = new URL(raw.DHOLE_NODE_SERVER_URL);
   if (serverUrl.protocol !== 'ws:' && serverUrl.protocol !== 'wss:') throw new Error('DHOLE_NODE_SERVER_URL must use ws:// or wss://');
   if (serverUrl.username || serverUrl.password) throw new Error('DHOLE_NODE_SERVER_URL must not include credentials');
@@ -72,7 +87,6 @@ export function loadNodeConfig(environment: NodeJS.ProcessEnv = process.env): No
     throw new Error('DHOLE_NODE_SECRETS must be a JSON object');
   }
   const secrets = new Map(Object.entries(NodeSecretsSchema.parse(secretInput)));
-  const stateDir = resolve(raw.DHOLE_NODE_STATE_DIR);
   return {
     serverUrl,
     ...(raw.DHOLE_NODE_MACHINE_ID === undefined ? {} : { machineId: raw.DHOLE_NODE_MACHINE_ID }),
@@ -101,10 +115,8 @@ export function readCredentialState(path: string): CredentialState | undefined {
   try { chmodSync(path, 0o600); } catch { /* best effort */ }
   try {
     const value = JSON.parse(readFileSync(path, 'utf8')) as unknown;
-    if (!value || typeof value !== 'object') return undefined;
-    const record = value as Record<string, unknown>;
-    if (typeof record.machineId !== 'string' || typeof record.credential !== 'string') return undefined;
-    return { machineId: record.machineId, credential: record.credential, ...(typeof record.updatedAt === 'string' ? { updatedAt: record.updatedAt } : {}) };
+    const result = CredentialStateSchema.safeParse(value);
+    return result.success ? result.data : undefined;
   } catch {
     return undefined;
   }
@@ -112,18 +124,25 @@ export function readCredentialState(path: string): CredentialState | undefined {
 
 /** Persist credentials using a 0600 temporary file + rename + fsync protocol. */
 export function writeCredentialState(path: string, state: CredentialState): void {
+  writePrivateJson(path, { machineId: state.machineId, credential: state.credential, updatedAt: state.updatedAt ?? new Date().toISOString() });
+}
+
+export function writePrivateJson(path: string, value: unknown): void {
   ensureStateDir(path);
   const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
-  const payload = JSON.stringify({ machineId: state.machineId, credential: state.credential, updatedAt: state.updatedAt ?? new Date().toISOString() });
-  const fd = openSync(temporary, 'w', 0o600);
+  const payload = JSON.stringify(value);
+  const fd = openSync(temporary, 'wx', 0o600);
   try {
-    writeSync(fd, payload, undefined, 'utf8');
-    fsyncSync(fd);
-  } finally {
-    closeSync(fd);
+    try {
+      writeSync(fd, payload, undefined, 'utf8');
+      fsyncSync(fd);
+    } finally { closeSync(fd); }
+    chmodSync(temporary, 0o600);
+    renameSync(temporary, path);
+  } catch (error) {
+    try { unlinkSync(temporary); } catch { /* The file may have been renamed already. */ }
+    throw error;
   }
-  chmodSync(temporary, 0o600);
-  renameSync(temporary, path);
   try {
     const directoryFd = openSync(dirname(path), 'r');
     try { fsyncSync(directoryFd); } finally { closeSync(directoryFd); }

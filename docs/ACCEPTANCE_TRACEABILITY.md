@@ -1,7 +1,17 @@
 # Acceptance traceability
 
+## Historical baseline
+
+This matrix preserves the original MVP acceptance record before the
+2026-09-05 module, authentication, agent-client, Gateway, and packaging work.
+Its test counts and UI observations are historical evidence, not a new run.
+The latest delivery scope is in [MVP status](MVP_STATUS.md). Criterion 44
+concerns the local fixture workflow; ADR 0002 now permits production Podman
+and optional Newt packaging.
+
 This matrix maps each acceptance criterion in the implementation brief to the
-actual route, service, test, or manual command in this checkout. `implemented`
+route, service, test, or manual command at that historical revision. Some
+referenced modules have since been retired under ADR 0003. `implemented`
 means the local path is present and covered by code or a deterministic test;
 `fixture` means the criterion is demonstrated with the fake node/runtime or
 checked-in fixture; `external-unverified` means the real external dependency
@@ -61,3 +71,42 @@ machine, provider, or external runtime. Criterion 36 remains
 `external-unverified` until an operator supplies and approves live runtime
 executables and credentials. No criterion is evidence of a production
 deployment or external reverse-proxy configuration.
+
+
+## Historical integration evidence before product narrowing
+
+`pnpm verify` passed on 2026-09-05 with exit code 0. It passed 578 workspace
+tests across 49 files: server 437, node 121, web 16, and shared 4. The client
+hook suite passed 32 tests with one optional installed-OpenCode test skipped.
+A separate explicit isolated OpenCode 1.18.27 run passed all 33 client tests.
+Production builds, all three runtime/session/onboarding smoke checks, and
+static environment/Compose checks passed. The final recovery-inclusive image
+also passed isolated no-network fresh-start and container-recreation checks
+with zero source-input drift. The historical baseline in [MVP status](MVP_STATUS.md) records its exact
+image and source-snapshot IDs. No live provider, real account recovery,
+external machine enrollment, existing-service activation, or production
+deployment is part of this result.
+
+| Area | Evidence at that revision | Verification boundary |
+| --- | --- | --- |
+| Optional modules | `lib/module.test.ts`, `lib/module-host.test.ts`, static contributions and lifecycle in `app.ts` | Core/Access with optional modules disabled; invalid dependencies and disabled route/worker behavior |
+| Native accounts and device scope | `recover-account.test.ts`, Core/access tests, device approval/project derivation, current native project authorization | Fixture identities and temporary-database recovery grants only; production setup remains operator-owned |
+| Node and agent onboarding | `apps/node/src/onboarding.test.ts`, `bridge.test.ts`, `installer.test.ts`, `scripts/onboarding-smoke.mjs` | Actual application approval/poll, private state, MCP headers, native project creation and restart claim recovery; no real machine setup |
+| Coordination parity | Coordination/MCP tests and migration `012_coordination_integrity.sql` | Ownership, same-checkout overlap, capability proof, revival, idempotent completion and native lifecycle |
+| Gateway catalog | `gateway/catalog.test.ts`, migrations `008_gateway_catalog.sql` and `015_gateway_catalog_authority.sql`, `clients/opencode/catalog.test.mjs` | Both response envelopes, scope/policy/freshness, and actual isolated OpenCode 1.18.27 startup; no provider inference |
+| Gateway administration | `gateway/management.test.ts`, `gateway/index.test.ts`, migration `010_gateway_management.sql` | Bounded typed settings/account/consent fixtures, revision checks and redaction; no live CPA call |
+| Gateway operations | `gateway/operations.test.ts`, migration `011_gateway_operations.sql` | Deduplicated import/export, bounded UTC aggregation and local retention; no continuous upstream completeness claim |
+| Typed Gateway agent client | `apps/node/src/gateway-client.test.ts`, `gateway-client.ts`, `bridge.test.ts` | 25 fixed operations; actual application smoke covers private catalog-token issuance and catalog 401 after device revocation; no generic URL or queue action |
+| Browser UI | Local browser checks by the integration owner | Native sign-in, Core-only routing and module/navigation gating, and full UI; no live setup |
+| Deployment artifacts | `scripts/deployment-check.mjs`, `Containerfile`, `compose.yaml`, `.env.example` | Static checks and final image fresh-start/recreation smoke passed without network; no deployment or existing-service activation |
+
+The [auth security review](reviews/auth-security.md) records resolved
+revocation and request-race findings. The [MVP acceptance
+review](reviews/mvp-acceptance.md) preserves the first reviewed failures and
+its follow-up closure evidence. Initial findings are historical once the
+corresponding client-to-application fixture closes them; neither report
+substitutes for the release gate.
+
+Those verification and image results belong to the earlier integration
+baseline. [MVP status](MVP_STATUS.md) owns the current product scope and new
+verification result; this record does not reuse a previous gate for changed code.

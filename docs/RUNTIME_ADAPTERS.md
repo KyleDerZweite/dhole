@@ -75,7 +75,7 @@ command. Unrecognized native data is retained rather than discarded: adapters
 either preserve the native type as a bounded `runtime.<type>` event or use
 `runtime.raw` with `nativeMethod`, `nativeType`, `params`, or `raw` fields.
 
-## Sessions → Fleet execution path
+## Core session execution path
 
 The normal interactive path is server-owned and durable:
 
@@ -85,7 +85,7 @@ The normal interactive path is server-owned and durable:
    the run, root activation, and turn, marks the human message delivered, and
    derives the operation key
    `session:<sessionId>:run:<runId>:create` for `create_runtime_session`.
-2. Sessions hands that command to Fleet. Fleet validates the Zod command,
+2. Sessions hands that command to Core machine transport. Core machine transport validates the Zod command,
    project/team and repository scope, and the operation-key payload. It stores
    one durable `node_commands` row in `queued` state and delivers it over the
    authenticated `dhole.node.v1` WebSocket when the node is connected.
@@ -93,7 +93,7 @@ The normal interactive path is server-owned and durable:
    runtime session, and reports `accepted` then `running`. On completion it
    reports one terminal `command_status` containing the bounded, redacted
    result (including adapter events where the adapter returned them).
-4. A one-second server maintenance tick calls Sessions maintenance, Fleet
+4. A one-second server maintenance tick calls Sessions maintenance, Core machine transport
    stale/retry handling, outbox flushing, and pending delivery. Sessions reads
    the durable create row, records the returned `runtimeSessionId` on the
    activation, and derives a stable `...:resume` key for later turns before
@@ -101,11 +101,11 @@ The normal interactive path is server-owned and durable:
    materializes the agent message; failed, expired, or cancelled commands fail
    the turn/run/session. Existing operation rows are reused, never duplicated.
 
-On reconnect, the node's hello includes journal operation summaries. Fleet
+On reconnect, the node's hello includes journal operation summaries. Core machine transport
 reconciles accepted/running/uncertain rows, sends a bounded `reconcile` list,
 and re-delivers queued/delivered/accepted/running commands. `uncertain` is
 operator-reconciled and is deliberately not re-delivered automatically. A
-repeated operation key must have the same canonical command payload; Fleet
+repeated operation key must have the same canonical command payload; Core machine transport
 rejects a conflicting reuse and the node journal never respawns a previously
 accepted/running/completed operation. This is at-least-once delivery with
 explicit reconciliation, not an assumption that a WebSocket send means the
@@ -127,8 +127,8 @@ trusted for routing. Sessions classifies the live stream as follows:
   subscribers through the normal event watermark.
 
 The terminal `command_status` result also retains a bounded event list. Node
-and Fleet drop transient entries first and preserve durable approval/tool
-events within a 900 KiB terminal-result budget. Fleet validates the survivors
+and Core machine transport drop transient entries first and preserve durable approval/tool
+events within a 900 KiB terminal-result budget. Core machine transport validates the survivors
 and replays them through the same handler so a lost live frame can recover a
 durable event; the event ID makes this replay idempotent. If the durable events
 alone cannot fit, the command becomes `uncertain` and no false completed result
@@ -148,7 +148,7 @@ below, and no turn is blindly replayed.
 
 Sessions sanitizes obvious credentials before outbound user/steering text is
 placed in a command (PEM private-key blocks, `Bearer` tokens, common `sk`/`rk`/
-`pk` keys, and key/value forms such as `api-key=...`). Node and Fleet apply
+`pk` keys, and key/value forms such as `api-key=...`). Node and Core machine transport apply
 additional field-key, string, size, and opaque-output redaction to command
 results, errors, descriptors, and journal status. This is a pattern-based
 defense; callers must still avoid putting secrets in prompts, commands, or
@@ -315,7 +315,7 @@ At the node boundary each adapter callback is wrapped as a `dhole.node.v1`
 `runtime_event` frame. The event kind, payload, per-command sequence, and
 deterministic event ID are bounded before sending. The same events are included
 in the terminal result when they fit the bounded status envelope, allowing
-Fleet to replay durable approval/tool events after a lost live frame.
+Core machine transport to replay durable approval/tool events after a lost live frame.
 
 ## Availability and recovery truth
 
@@ -353,7 +353,7 @@ aborts active session controllers, closes registered adapters, stops heartbeat
 and reconnect timers, and closes the WebSocket. A queued session command that
 has not started fails with `node stopped before execution`. If a runtime
 operation had already started and shutdown races its external side effect, the
-journal records `uncertain`; Fleet does not expire or redeliver that operation
+journal records `uncertain`; Core machine transport does not expire or redeliver that operation
 automatically. On the next start, accepted/running journal entries are likewise
 converted to `uncertain` and require explicit reconciliation or resume.
 

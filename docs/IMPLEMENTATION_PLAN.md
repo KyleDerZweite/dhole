@@ -1,11 +1,23 @@
-# Dhole MVP implementation plan
+# MVP delivery record
 
-1. Lock the wire contracts, security profile, event envelope, additive migrations, and static module registry.
-2. Complete the vertical path: migrate database, authenticate two users, register a project, enroll a fake node, create a shared fake-runtime session, stream it to both users, and persist audit/events.
-3. Add sessions, lineage, approvals, control leases, durable node delivery, claims, worktrees, and restart-safe orchestration.
-4. Add thin truthful Codex, Claude Code, Kimi ACP, and OpenAI-compatible adapters plus fixture Gateway ingestion.
-5. Add immutable memory, portable skills, deterministic Lab comparisons, and human decisions.
-6. Build the three-area dashboard and progressively disclosed detail surfaces against the same APIs used in production.
-7. Complete documentation, threat modeling, license notices, acceptance mapping, independent reviews, and the full verification matrix.
+The initial implementation established shared contracts, SQLite migrations,
+authentication, fixture sessions and nodes, coordination, Gateway request
+history, runtime adapters, orchestration, memory, skills, and Lab comparisons.
+The historical acceptance matrix is in
+[Acceptance traceability](ACCEPTANCE_TRACEABILITY.md).
 
-Implementation slices own non-overlapping directories. Shared schemas and migrations change only through the integration owner.
+The 2026-09-05 release work adds selectable modules, optional GitHub identity,
+machine authorization and a local agent bridge, stronger coordination
+lifecycle behavior, optional CPA catalog and administration, and Podman/Newt
+packaging. ADR 0003 then narrows the active product to Core and Access with
+optional Coordination, Gateway, and MCP. Core owns the master overview,
+sessions, runtime/provider configuration, agent activity, and machine transport.
+Memory, Lab, orchestration, and server Skills are removed; client Skills remain
+in `clients/skills`. Fleet is a separate private project. [MVP status](MVP_STATUS.md) records the delivered behavior against
+the issue #2 implementation items. [Roadmap](../ROADMAP.md) is the sole ledger
+for deliberate deferrals.
+
+Release work finishes when `pnpm verify` passes, deployment artifacts pass
+their local checks, and documentation distinguishes fixtures from external
+acceptance. Those checks do not authorize deployment, provider calls, machine
+enrollment, or initialization of live Mediation.

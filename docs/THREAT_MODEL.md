@@ -1,12 +1,12 @@
 # Threat model
 
-Reviewed for the MVP architecture on 2026-08-31. This model covers the central server, browser, node daemon, local runtime subprocesses, SQLite, Git workspaces, Gateway connector, and MCP boundary.
+Originally reviewed on 2026-08-31; scope aligned with ADR 0003 on 2026-09-05. This model covers the central server, browser, node daemon, local runtime subprocesses, SQLite, Git workspaces, Gateway connector, and MCP boundary.
 
 ## Assets
 
 - User credentials, session cookies, CSRF tokens, device credentials, enrollment tokens, API tokens, provider and CLIProxy management secrets.
-- Private session transcripts, tool results, approvals, repository paths and diffs, memory, skills, benchmark fixtures, audit history, and provider usage.
-- Integrity of commands, claims, agent lineage, scheduler placement, worktrees, pricing, promotions, and event ordering.
+- Private session transcripts, tool results, approvals, repository paths and diffs, client Skills, audit history, and provider usage.
+- Integrity of commands, claims, agent lineage, session placement, worktrees, pricing, and event ordering.
 
 ## Trust boundaries
 
@@ -28,14 +28,12 @@ The browser is untrusted and communicates only with the central server. A node i
 | Malicious provider/runtime output | Bounded protocol and normalized-frame validation, size/time/tool-round limits, plain-text UI, no raw HTML, redacted unknown events | Adapter/UI tests |
 | SSRF through Gateway | Administrator-only config, http/https URL parsing, explicit allowed hosts, no browser proxy or CLIProxy /api-call, bounded fetch and redirects | URL rejection tests |
 | Usage import poisoning | Size/page limits, event hashes, schema validation, redaction before storage, exact/approximate correlation labels | Fixture/fuzzed-record tests |
-| Orchestration bypass or resource exhaustion | Explicit action, scoped director tools, atomic claim-before-spawn, durable leases, depth/child/concurrency/retry/budget limits | Scheduler tests |
-| Memory/skill prompt injection | Source provenance, human approval, immutable generations, active-only explicit injection, size delimiters, bounded references/no traversal | Memory/skill tests |
-| Automatic unsafe promotion | Append-only benchmark evidence and human decision; no automatic skill/model promotion | Lab tests |
+| Untrusted client Skill installation | Explicit target directory, owned-file markers, symlink rejection, bounded maintained files; installed instructions confer no server authority | Node installer tests |
 | Database or local state theft | Mode 0600 database/node files, external master key, no raw provider credentials, minimized private fields | Startup/file-mode tests |
 
 ## Security profile
 
-Production fails to start without a current key ID present in DHOLE_MASTER_KEYS. HTTPS/WSS is mandatory outside loopback development. Allowed hosts, public origin, Gateway hosts, retention, and repository roots are explicit configuration. HTTP JSON bodies default to a 512 KiB cap unless a route sets a narrower limit; the authenticated node WebSocket protocol permits at most 1 MiB frames, while app WebSocket frames are limited to 256 KiB. Logs contain method, path template, status, request ID, and redacted summaries only—not bodies, cookies, headers, environment, tool arguments, or private paths.
+Production fails to start without a current key ID present in DHOLE_MASTER_KEYS. HTTPS/WSS is mandatory outside loopback development. Allowed hosts, public origin, Gateway hosts, retention, and repository roots are explicit configuration. HTTP JSON bodies default to a 512 KiB cap unless a route sets a narrower limit; the authenticated node WebSocket protocol permits at most 1 MiB frames, while app WebSocket frames are limited to 256 KiB. Logs contain method, path template, status, request ID, and redacted summaries only. They omit bodies, cookies, headers, environment, tool arguments, and private paths.
 
 Known demo passwords are seeded only when DHOLE_DEMO is enabled outside production. Demo mode never enables live provider calls.
 
@@ -44,7 +42,7 @@ Known demo passwords are seeded only when DHOLE_DEMO is enabled outside producti
 The node enrollment capability is intentionally a one-time bootstrap channel:
 the administrator's enrollment-token issuance response contains a one-use
 enrollment token,
-`POST /api/fleet/enrollment/consume` returns a replaceable device credential
+`POST /api/machines/enrollment/consume` returns a replaceable device credential
 only to the caller that presents the unexpired, single-use enrollment token.
 Credential rotation likewise returns the replacement only to an administrator
 API-token request carrying `fleet:admin`; cookie-authenticated dashboard calls

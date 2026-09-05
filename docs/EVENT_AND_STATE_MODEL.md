@@ -2,7 +2,7 @@
 
 ## Authority
 
-SQLite operational rows are the source of current Dhole state. A realtime or replay-visible transition and its normalized event are committed in the same transaction. Setup/configuration mutations without a normalized event kind—such as project, repository, memory-pack, skill, and benchmark-definition changes—commit an immutable `audit_records` row instead. The append-only event log is the ordered source for replay to clients, adapter evidence, and integrations; it is not used to rebuild every operational table.
+SQLite operational rows are the source of current Dhole state. A realtime or replay-visible transition and its normalized event are committed in the same transaction. Setup/configuration mutations without a normalized event kind, such as project, repository, and provider changes, commit an immutable `audit_records` row instead. The append-only event log is the ordered source for replay to clients, adapter evidence, and integrations; it is not used to rebuild every operational table.
 
 Each project owns a strictly increasing sequence. The event envelope contains event ID, project sequence, aggregate and optional parent, actor, provenance, schema version, idempotency key, timestamp, and a versioned payload. Provider-native identifiers remain server-side references and are redacted before persistence.
 
@@ -38,11 +38,16 @@ The server delivers node commands at least once. Every command has a stable oper
 
 Command states are queued, delivered, accepted, running, completed, failed, uncertain, cancelled, and expired. Network delivery never implies execution.
 
-## Orchestration
+## Coordination and retired history
 
-Orchestration execution states are queued, running, paused, cancelling, settled, failed, and cancelled. Work items have explicit dependencies and transition through claim acquisition before scheduling. Scheduler leases and timestamps permit restart recovery. Pause stops new placement; cancel propagates. Claims are released or settled on every terminal path.
+Interactive coordination conflicts are warnings. An explicit enforced claim
+rejects blocking overlap in the same transaction that acquires the reservation.
+Claim completion, release, and recovery preserve terminal history.
 
-Interactive coordination conflicts are warnings. Dhole-managed scheduling atomically rejects blocking overlap before spawn.
+Orchestration, Memory, server Skills, and Lab are retired from the active
+product. Their applied migrations and immutable history remain intact. Stored
+rows and legacy event kinds do not enable their former routes, tools, or jobs.
+See [ADR 0003](adr/0003-core-and-product-focus.md).
 
 ## Schema evolution
 

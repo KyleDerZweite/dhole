@@ -66,5 +66,6 @@ export async function parseJson<T>(context: Context<AppEnvironment>, schema: Zod
   }
   const result = schema.safeParse(body);
   if (!result.success) throw new HttpError(422, 'validation_failed', result.error.issues[0]?.message ?? 'Invalid request');
+  context.get('assertAuthorizationCurrent')?.();
   return result.data;
 }

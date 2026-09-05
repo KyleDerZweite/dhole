@@ -21,6 +21,9 @@
     "typecheck": "pnpm --filter @dhole-control/shared build && pnpm -r typecheck",
     "smoke:runtime": "node scripts/runtime-path-smoke.mjs",
     "smoke:session": "node scripts/session-runtime-smoke.mjs",
-    "verify": "pnpm format:check && pnpm lint && pnpm typecheck && pnpm test:run && pnpm build && pnpm smoke:runtime && pnpm smoke:session"
+    "smoke:onboarding": "node scripts/onboarding-smoke.mjs",
+    "test:clients": "node --test clients/opencode/catalog.test.mjs",
+    "check:deployment": "node scripts/deployment-check.mjs",
+    "verify": "pnpm format:check && pnpm lint && pnpm typecheck && pnpm test:run && pnpm test:clients && pnpm build && pnpm smoke:runtime && pnpm smoke:session && pnpm smoke:onboarding && pnpm check:deployment"
   }
 }

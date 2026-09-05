@@ -9,18 +9,21 @@
     "build": "vite build",
     "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
     "preview": "vite preview",
-    "lint": "tsc -p tsconfig.typecheck.json --noEmit",
-    "typecheck": "tsc -p tsconfig.typecheck.json --noEmit",
+    "lint": "svelte-check --tsconfig ./tsconfig.json",
+    "typecheck": "svelte-check --tsconfig ./tsconfig.json",
     "test": "vitest",
     "test:run": "vitest run --passWithNoTests"
   },
   "dependencies": {
-    "svelte": "5.57.0"
+    "@lucide/svelte": "1.41.0",
+    "svelte": "5.57.0",
+    "zod": "4.5.4"
   },
   "devDependencies": {
     "@sveltejs/vite-plugin-svelte": "6.2.1",
     "@types/node": "24.10.0",
-    "typescript": "7.0.2",
+    "svelte-check": "4.7.6",
+    "typescript": "6.0.3",
     "vite": "7.3.5",
     "vitest": "4.1.11"
   }

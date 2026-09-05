@@ -1,0 +1,11 @@
+# Optional GitHub account linking and repository permission checks.
+# Add this file explicitly after compose.yaml; native Dhole accounts stay enabled.
+services:
+  dhole:
+    environment:
+      DHOLE_GITHUB_CLIENT_ID: ${DHOLE_GITHUB_CLIENT_ID:?Set the optional GitHub client ID}
+      DHOLE_GITHUB_CLIENT_SECRET: ${DHOLE_GITHUB_CLIENT_SECRET:?Set the optional GitHub client secret}
+      DHOLE_GITHUB_APP_ID: ${DHOLE_GITHUB_APP_ID:?Set the optional numeric GitHub App ID}
+      DHOLE_GITHUB_APP_PRIVATE_KEY_FILE: /run/secrets/github-app.pem
+    volumes:
+      - ${DHOLE_GITHUB_APP_PRIVATE_KEY_PATH:?Set the host path to the optional GitHub App PEM}:/run/secrets/github-app.pem:ro,Z

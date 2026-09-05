@@ -1,6 +1,6 @@
 # ADR 0001: MVP architecture lock
 
-Status: accepted on 2026-08-30.
+Status: accepted on 2026-08-30. Product scope and orchestration are superseded by [ADR 0003](0003-core-and-product-focus.md); the remaining runtime, event, and security decisions still apply.
 
 ## Decision
 
@@ -28,11 +28,11 @@ Reconnect uses snapshot, watermark, catch-up, then live delivery. Provider token
 
 Missing executables or credentials produce an unavailable capability state. Fixture adapters never masquerade as live adapters.
 
-## Durability and scheduling
+## Durability and historical scheduling
 
 Node delivery is at least once. Before a spawn, the node atomically writes an operation journal entry with mode 0600. A repeated accepted/running/completed operation key never spawns again; an ambiguous crash is reported as uncertain for reconciliation.
 
-Orchestration is explicit and durable. A database state machine owns leases, claims, placement, concurrency, depth, children, retries, pause, resume, cancel, and restart recovery. A director can request bounded actions but cannot schedule processes or bypass claims directly.
+The following orchestration decision describes the original scope, retired by ADR 0003. Orchestration was explicit and durable. A database state machine owns leases, claims, placement, concurrency, depth, children, retries, pause, resume, cancel, and restart recovery. A director can request bounded actions but cannot schedule processes or bypass claims directly.
 
 ## Security
 

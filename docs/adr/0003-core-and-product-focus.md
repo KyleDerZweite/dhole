@@ -1,0 +1,7 @@
+# Core owns agent work; modules own optional products
+
+Accepted on 2026-09-05 after the product scope was narrowed. Core includes native accounts, project authorization, shared sessions, agent activity, runtime/provider configuration, the master dashboard, and the outbound machine transport required to execute work. Coordination and Gateway are optional product modules; MCP is an optional protocol module. Core and Access remain available with `DHOLE_MODULES=none`.
+
+Memory, Improvement Lab, orchestration, and the server Skills feature are removed from the active product. Static agent Skills in `clients/` remain client instructions. Fleet is the user's separate private project, so Dhole exposes Machines as a Core responsibility; old Fleet wire paths and scopes may remain only for compatibility. Moving these facilities into Core keeps a useful working application when every optional module is disabled, without publishing a Fleet product or retaining unrelated experimental features.
+
+This supersedes the optional Sessions/Runtime/Fleet interpretation and orchestration scope in ADRs 0001 and 0002. Existing migrations and immutable history remain intact, but retired routes, tools, navigation, and jobs do not remain active merely because their tables exist. The four runtime package boundaries, native account authority, Podman/Newt packaging, and restrictions on live setup are unchanged. Dhole remains the project name while the name and animal-brand research is evaluated.

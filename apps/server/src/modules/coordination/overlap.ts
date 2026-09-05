@@ -3,6 +3,7 @@ import type { ClaimScope } from '@dhole-control/shared';
 /** The smallest useful overlap model shared by the API, orchestration and MCP. */
 export interface OverlapClaim {
   id: string;
+  workItemId?: string | null;
   coordinationSessionId?: string | null;
   /** New Dhole shape. */
   scope?: ClaimScope;
@@ -35,6 +36,7 @@ export interface ConflictWarning {
 }
 
 export interface WorkScope extends Omit<ClaimScope, 'task' | 'worktree'> {
+  workItemId?: string | null;
   task?: string | null | undefined;
   worktree?: string | null | undefined;
   sessionId?: string | null;
@@ -84,10 +86,6 @@ export function pathsOverlap(left: string, right: string): boolean {
 
 export function filesOverlap(left: readonly string[], right: readonly string[]): boolean {
   return left.some((a) => right.some((b) => pathsOverlap(a, b)));
-}
-
-function sameWorktree(left: string | null | undefined, right: string | null | undefined): boolean {
-  return Boolean(left && right && left === right);
 }
 
 function scopeOf(claim: OverlapClaim): WorkScope {
@@ -142,15 +140,14 @@ export function hasBlockingOverlap(reasons: readonly OverlapReason[]): boolean {
   return reasons.some((reason) => reason.type === 'files' || reason.type === 'components');
 }
 
-/** Return warnings for active claims, suppressing same-session and same-worktree noise. */
+/** Only the same session is known to be the same worker. A checkout can host several agents. */
 export function checkOverlap(activeClaims: readonly OverlapClaim[], proposed: WorkScope): ConflictWarning[] {
   for (const file of proposed.files) assertSafePath(file);
   const warnings: ConflictWarning[] = [];
   for (const claim of activeClaims) {
     for (const file of scopeOf(claim).files) assertSafePath(file);
     const sessionId = claim.coordinationSessionId ?? claim.sessionId;
-    if (proposed.sessionId && sessionId === proposed.sessionId) continue;
-    if (sameWorktree(proposed.worktree, scopeOf(claim).worktree)) continue;
+    if (proposed.sessionId && sessionId === proposed.sessionId && (claim.workItemId ?? null) === (proposed.workItemId ?? null)) continue;
     const reasons = overlapReasons(proposed, claim);
     if (reasons.length) {
       const warning: ConflictWarning = {
@@ -184,8 +181,7 @@ export function pairConflicts(activeClaims: readonly OverlapClaim[]): PairConfli
       const right = activeClaims[j]!;
       const leftSession = left.coordinationSessionId ?? left.sessionId;
       const rightSession = right.coordinationSessionId ?? right.sessionId;
-      if (leftSession && leftSession === rightSession) continue;
-      if (sameWorktree(scopeOf(left).worktree, scopeOf(right).worktree)) continue;
+      if (leftSession && leftSession === rightSession && (left.workItemId ?? null) === (right.workItemId ?? null)) continue;
       const reasons = overlapReasons({
         files: scopeOf(right).files,
         components: scopeOf(right).components,

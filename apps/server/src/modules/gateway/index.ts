@@ -5,6 +5,11 @@ import { redactText, decryptSecret, encryptSecret } from '../../lib/security.js'
 import { HttpError, parseJson } from '../../lib/http.js';
 import type { AuthenticatedUser, DholeApp, DholeModule, ServerContext } from '../../lib/module.js';
 import { recordAudit } from '../core/index.js';
+import { registerGatewayManagementRoutes, GatewayConnectionUpdateSchema, GatewaySettingKeySchema, type GatewayConnectionUpdate, type GatewaySettingKey } from './management.js';
+export { GatewayConnectionUpdateSchema, GatewaySettingKeySchema } from './management.js';
+export type { GatewayConnectionUpdate, GatewaySettingKey } from './management.js';
+import { registerGatewayCatalogRoutes } from './catalog.js';
+import { registerGatewayOperationsRoutes, startGatewayRetention } from './operations.js';
 
 /** A deliberately small, permissive boundary for the formats emitted by CLIProxyAPI. */
 export const CliProxyRecordSchema = z.record(z.string(), z.unknown());
@@ -13,6 +18,7 @@ export const GatewayConnectionInputSchema = z.object({
   name: z.string().trim().min(1).max(120),
   baseUrl: z.string().trim().min(1).max(2_048),
   managementSecret: z.string().min(1).max(16_384),
+  catalogSecret: z.string().min(1).max(16_384).optional(),
   enabled: z.boolean().optional().default(true),
   retentionDays: z.number().int().min(1).max(3_650).optional().default(30),
 });
@@ -29,6 +35,11 @@ export const GatewayPriceOverrideSchema = z.object({
   serviceTier: z.string().trim().min(1).max(80).nullable().optional(),
 });
 
+
+export const GatewayConnectionMetadataSchema = z.object({
+  name: z.string().min(1).max(120), baseUrl: z.string().max(2_048), enabled: z.boolean(), retentionDays: z.number().int().min(1).max(3_650), archivedAt: z.string().nullable(), deletedAt: z.string().nullable(),
+}).strict();
+export type GatewayConnectionMetadata = z.infer<typeof GatewayConnectionMetadataSchema>;
 export type GatewayConnectionInput = z.infer<typeof GatewayConnectionInputSchema>;
 export type GatewayPriceOverrideInput = z.infer<typeof GatewayPriceOverrideSchema>;
 
@@ -81,6 +92,7 @@ export interface GatewayFetchResult {
   ok: boolean;
   status: number;
   body: unknown;
+  upstreamVersion?: string;
 }
 
 export interface GatewayServiceOptions {
@@ -172,12 +184,17 @@ export interface PriceOverride {
   serviceTier: string | null;
 }
 
-interface DbConnectionRow {
+export interface DbConnectionRow {
   id: string;
   team_id: string;
   name: string;
   base_url: string;
   secret_id: string | null;
+  catalog_secret_id: string | null;
+  provider_id: string | null;
+  revision: number;
+  archived_at: string | null;
+  deleted_at: string | null;
   enabled: number;
   status: string;
   last_checked_at: string | null;
@@ -187,7 +204,7 @@ interface DbConnectionRow {
   updated_at: string;
 }
 
-interface DbRequestRow {
+export interface DbRequestRow {
   id: string;
   event_hash: string;
   schema_version: number;
@@ -219,6 +236,10 @@ interface DbRequestRow {
 }
 
 interface DbAccountRow {
+  connection_id: string;
+  disabled: number;
+  management_supported: number;
+  observed_at: string;
   id: string;
   auth_index: string;
   provider: string;
@@ -299,7 +320,8 @@ function redactValue(value: unknown, depth = 0): unknown {
   if (Array.isArray(value)) return value.slice(0, 100).map((entry) => redactValue(entry, depth + 1));
   if (!value || typeof value !== 'object') return value;
   const output: Record<string, unknown> = {};
-  for (const [key, entry] of Object.entries(value)) {
+  for (const [key, entry] of Object.entries(value).slice(0, 100)) {
+    if (!/^[A-Za-z][A-Za-z0-9_ -]{0,79}$/.test(key) || redactText(key, 80) !== key) continue;
     if (REDACT_KEY.test(key)) output[key] = '[REDACTED]';
     else output[key] = redactValue(entry, depth + 1);
   }
@@ -377,6 +399,14 @@ async function readBoundedResponse(response: Response): Promise<string> {
   } finally {
     reader.releaseLock();
   }
+}
+
+function stripKnownSecrets(value: unknown, secrets: string[], depth = 0): unknown {
+  if (depth > 30) return null;
+  if (typeof value === 'string') return secrets.reduce((textValue, secret) => textValue.replaceAll(secret, '[REDACTED]'), value);
+  if (Array.isArray(value)) return value.map((entry) => stripKnownSecrets(entry, secrets, depth + 1));
+  if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([key, entry]) => [secrets.reduce((textValue, secret) => textValue.replaceAll(secret, '[REDACTED]'), key), stripKnownSecrets(entry, secrets, depth + 1)]));
+  return value;
 }
 
 function canonical(value: unknown): string {
@@ -463,16 +493,25 @@ export function parseCliProxyRecords(input: unknown): unknown[] {
   if (typeof input === 'string') {
     const trimmed = input.trim();
     if (!trimmed) return [];
-    try {
-      return parseCliProxyRecords(JSON.parse(trimmed));
-    } catch {
-      return trimmed.split(/\r?\n/).filter(Boolean).map((line, index) => {
-        try { return JSON.parse(line); } catch { throw new HttpError(422, 'invalid_fixture', `Invalid JSONL record at line ${index + 1}`); }
+    let parsed: unknown;
+    try { parsed = JSON.parse(trimmed); } catch {
+      const lines = trimmed.split(/\r?\n/).filter(Boolean);
+      if (lines.length > 5_000) throw new HttpError(422, 'gateway_record_limit', 'Import exceeds 5000 records');
+      parsed = lines.map((line, index) => {
+        try { return JSON.parse(line) as unknown; } catch { throw new HttpError(422, 'invalid_fixture', `Invalid JSONL record at line ${index + 1}`); }
       });
     }
+    return parseCliProxyRecords(parsed);
   }
-  if (Array.isArray(input)) return input;
-  const object = asRecord(input);
+  if (Array.isArray(input)) {
+    const records = z.array(CliProxyRecordSchema).max(5_000).safeParse(input);
+    if (!records.success) throw new HttpError(422, 'invalid_gateway_records', 'Import must contain at most 5000 record objects');
+    return records.data;
+  }
+  const parsed = CliProxyRecordSchema.safeParse(input);
+  if (!parsed.success) throw new HttpError(422, 'invalid_gateway_records', 'Import must contain record objects');
+  const object = parsed.data;
+  if (['request_id', 'requestId', 'model', 'provider', 'status_code', 'occurred_at'].some((key) => object[key] !== undefined)) return [object];
   for (const key of ['records', 'requests', 'usage', 'items', 'data']) {
     if (object[key] !== undefined) return parseCliProxyRecords(object[key]);
   }
@@ -486,7 +525,7 @@ function matchesModel(pattern: string, model: string): boolean {
 
 export function selectPriceOverride(model: string, occurredAt: string, serviceTier: string | undefined, contextTokens: number | undefined, overrides: readonly PriceOverride[]): PriceOverride | undefined {
   return overrides
-    .filter((override) => matchesModel(override.modelPattern, model) && override.effectiveFrom <= occurredAt)
+    .filter((override) => matchesModel(override.modelPattern, model) && Date.parse(override.effectiveFrom) <= Date.parse(occurredAt))
     .filter((override) => override.serviceTier === null || override.serviceTier === undefined || override.serviceTier === serviceTier)
     .filter((override) => override.contextThresholdTokens === null || override.contextThresholdTokens === undefined || (contextTokens ?? 0) > override.contextThresholdTokens)
     .sort((a, b) => {
@@ -526,71 +565,175 @@ export class GatewayService {
     this.#timeoutMs = Math.max(100, Math.min(options.timeoutMs ?? DEFAULT_TIMEOUT_MS, 60_000));
   }
 
-  private connection(id: string, teamId?: string): DbConnectionRow {
+  getConnection(id: string, teamId?: string): DbConnectionRow {
     const row = this.context.database.prepare('SELECT * FROM gateway_connections WHERE id = ?').get(id) as DbConnectionRow | undefined;
     if (!row || (teamId && row.team_id !== teamId)) throw new HttpError(404, 'gateway_connection_not_found', 'Gateway connection not found');
     return row;
   }
 
   assertConnection(id: string, teamId?: string): void {
-    this.connection(id, teamId);
+    this.getConnection(id, teamId);
   }
 
-  private secret(connection: DbConnectionRow): string {
-    if (!connection.secret_id) throw new HttpError(503, 'gateway_secret_unavailable', 'Gateway management secret is unavailable');
-    const row = this.context.database.prepare('SELECT * FROM provider_secrets WHERE id = ?').get(connection.secret_id) as { key_id: string; nonce: string; ciphertext: string; auth_tag: string } | undefined;
-    if (!row) throw new HttpError(503, 'gateway_secret_unavailable', 'Gateway management secret is unavailable');
-    try {
-      return decryptSecret(this.context.config, { keyId: row.key_id, nonce: row.nonce, ciphertext: row.ciphertext, authTag: row.auth_tag }, `gateway:${connection.id}:management`);
-    } catch {
+  getConnectionProviderId(id: string, teamId?: string): string {
+    const connection = this.getConnection(id, teamId);
+    if (!connection.provider_id) throw new HttpError(409, 'gateway_provider_unavailable', 'Gateway has no associated provider');
+    return connection.provider_id;
+  }
+
+  private assertActive(connection: DbConnectionRow): void {
+    if (!connection.enabled || connection.archived_at || connection.deleted_at) throw new HttpError(409, 'gateway_connection_disabled', 'Gateway connection is disabled or archived');
+  }
+
+  private secret(connection: DbConnectionRow, kind: 'management' | 'catalog' = 'management'): string | undefined {
+    const secretId = kind === 'management' ? connection.secret_id : connection.catalog_secret_id;
+    if (!secretId) {
+      if (kind === 'catalog') return undefined;
       throw new HttpError(503, 'gateway_secret_unavailable', 'Gateway management secret is unavailable');
+    }
+    const row = this.context.database.prepare('SELECT * FROM provider_secrets WHERE id = ? AND revoked_at IS NULL').get(secretId) as { key_id: string; nonce: string; ciphertext: string; auth_tag: string } | undefined;
+    if (!row) throw new HttpError(503, 'gateway_secret_unavailable', 'Gateway credential is unavailable');
+    try {
+      return decryptSecret(this.context.config, { keyId: row.key_id, nonce: row.nonce, ciphertext: row.ciphertext, authTag: row.auth_tag }, `gateway:${connection.id}:${kind}`);
+    } catch {
+      throw new HttpError(503, 'gateway_secret_unavailable', 'Gateway credential is unavailable');
     }
   }
 
-  createConnection(teamId: string, input: GatewayConnectionInput, actorId: string): { id: string; name: string; baseUrl: string; status: string; enabled: boolean } {
+  private storeSecret(connectionId: string, providerId: string, kind: 'management' | 'catalog', value: string): string {
+    let encrypted;
+    try { encrypted = encryptSecret(this.context.config, value, `gateway:${connectionId}:${kind}`); } catch { throw new HttpError(503, 'encryption_unavailable', 'Gateway credential cannot be encrypted'); }
+    const id = this.context.ids.id();
+    this.context.database.prepare('INSERT INTO provider_secrets(id, provider_id, label, key_id, nonce, ciphertext, auth_tag, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(id, providerId, `gateway-${kind}`, encrypted.keyId, encrypted.nonce, encrypted.ciphertext, encrypted.authTag, nowIso(this.context));
+    return id;
+  }
+
+  private metadata(connection: DbConnectionRow): GatewayConnectionMetadata {
+    return { name: connection.name, baseUrl: publicGatewayBaseUrl(connection.base_url) ?? '', enabled: connection.enabled === 1, retentionDays: connection.retention_days, archivedAt: connection.archived_at, deletedAt: connection.deleted_at };
+  }
+
+  private publicConnection(connection: DbConnectionRow): Record<string, unknown> {
+    return { id: connection.id, providerId: connection.provider_id, ...this.metadata(connection), revision: connection.revision, status: connection.status,
+      managementConfigured: connection.secret_id !== null, catalogConfigured: connection.catalog_secret_id !== null,
+      lastCheckedAt: connection.last_checked_at, lastErrorSummary: redactGatewaySummary(connection.last_error_summary), createdAt: connection.created_at, updatedAt: connection.updated_at };
+  }
+
+  private saveRevision(connection: DbConnectionRow, action: string, actorId?: string): void {
+    this.context.database.prepare('INSERT OR IGNORE INTO gateway_connection_revisions(connection_id, revision, action, metadata_json, actor_id, created_at) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(connection.id, connection.revision, action, JSON.stringify(this.metadata(connection)), actorId ?? null, nowIso(this.context));
+  }
+
+  createConnection(teamId: string, raw: GatewayConnectionInput, actorId: string): Record<string, unknown> & { id: string } {
+    const input = GatewayConnectionInputSchema.parse(raw);
     const url = validateGatewayUrl(input.baseUrl, this.context.config.gatewayAllowedHosts);
     const id = this.context.ids.id();
     const providerId = `${id}:provider`;
-    const secretId = this.context.ids.id();
     const now = nowIso(this.context);
-    let encrypted;
-    try { encrypted = encryptSecret(this.context.config, input.managementSecret, `gateway:${id}:management`); } catch { throw new HttpError(503, 'encryption_unavailable', 'Gateway management secret cannot be encrypted'); }
     try {
       this.context.database.transaction(() => {
-        this.context.database.prepare('INSERT INTO providers(id, team_id, kind, name, base_url, enabled, config_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)').run(providerId, teamId, 'cliproxy', `${input.name} gateway`, url.toString(), '{}', now, now);
-        this.context.database.prepare('INSERT INTO provider_secrets(id, provider_id, label, key_id, nonce, ciphertext, auth_tag, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(secretId, providerId, 'management', encrypted.keyId, encrypted.nonce, encrypted.ciphertext, encrypted.authTag, now);
-        this.context.database.prepare('INSERT INTO gateway_connections(id, team_id, name, base_url, secret_id, enabled, status, retention_days, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(id, teamId, input.name, url.toString(), secretId, input.enabled ? 1 : 0, 'unknown', input.retentionDays, now, now);
+        this.context.database.prepare('INSERT INTO providers(id, team_id, kind, name, base_url, enabled, config_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)').run(providerId, teamId, 'cliproxy', `${input.name} gateway`, url.toString(), input.enabled ? 1 : 0, '{}', now, now);
+        const secretId = this.storeSecret(id, providerId, 'management', input.managementSecret);
+        const catalogSecretId = input.catalogSecret ? this.storeSecret(id, providerId, 'catalog', input.catalogSecret) : null;
+        this.context.database.prepare('INSERT INTO gateway_connections(id, team_id, name, base_url, secret_id, catalog_secret_id, provider_id, enabled, status, retention_days, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(id, teamId, input.name, url.toString(), secretId, catalogSecretId, providerId, input.enabled ? 1 : 0, 'unknown', input.retentionDays, now, now);
+        this.saveRevision(this.getConnection(id), 'create', actorId);
         this.audit(actorId, 'gateway.connection.create', 'gateway_connection', id);
       })();
     } catch (error) {
       if (error instanceof Error && error.message.includes('UNIQUE')) throw new HttpError(409, 'gateway_connection_exists', 'Gateway connection name already exists');
       throw error;
     }
-    return { id, name: input.name, baseUrl: url.toString(), status: 'unknown', enabled: input.enabled };
+    return { ...this.publicConnection(this.getConnection(id)), id };
   }
 
   listConnections(teamId: string): Array<Record<string, unknown>> {
-    return (this.context.database.prepare('SELECT id, name, base_url AS baseUrl, enabled, status, last_checked_at AS lastCheckedAt, last_error_summary AS lastErrorSummary, retention_days AS retentionDays, created_at AS createdAt, updated_at AS updatedAt FROM gateway_connections WHERE team_id = ? ORDER BY name').all(teamId) as Array<Record<string, unknown>>).map((row) => ({
-      id: row.id,
-      name: row.name,
-      baseUrl: publicGatewayBaseUrl(row.baseUrl),
-      enabled: row.enabled === 1,
-      status: row.status,
-      lastCheckedAt: row.lastCheckedAt,
-      lastErrorSummary: redactGatewaySummary(row.lastErrorSummary),
-      retentionDays: row.retentionDays,
-      createdAt: row.createdAt,
-      updatedAt: row.updatedAt,
-    }));
+    return (this.context.database.prepare('SELECT * FROM gateway_connections WHERE team_id = ? ORDER BY name').all(teamId) as DbConnectionRow[]).map((row) => this.publicConnection(row));
+  }
+
+  connectionRevisions(id: string, teamId: string): Array<Record<string, unknown>> {
+    this.getConnection(id, teamId);
+    return (this.context.database.prepare('SELECT * FROM gateway_connection_revisions WHERE connection_id = ? ORDER BY revision DESC LIMIT 100').all(id) as Array<{ revision: number; action: string; metadata_json: string; actor_id: string | null; created_at: string }>)
+      .map((row) => ({ revision: row.revision, action: row.action, metadata: GatewayConnectionMetadataSchema.parse(JSON.parse(row.metadata_json)), actorId: row.actor_id, createdAt: row.created_at }));
+  }
+
+  async checkConnectionChange(id: string, teamId: string, raw: GatewayConnectionUpdate): Promise<void> {
+    const input = GatewayConnectionUpdateSchema.parse(raw);
+    const current = this.getConnection(id, teamId);
+    if (current.deleted_at) throw new HttpError(409, 'gateway_connection_deleted', 'Deleted connections retain history and cannot be changed');
+    if (current.revision !== input.expectedRevision) throw new HttpError(409, 'gateway_revision_conflict', 'Connection changed; reload before applying edits');
+    const enabled = input.enabled ?? current.enabled === 1;
+    if (!enabled || input.baseUrl === undefined && input.managementSecret === undefined && input.catalogSecret === undefined && current.enabled === 1) return;
+    const candidate = { ...current, base_url: input.baseUrl === undefined ? current.base_url : validateGatewayUrl(input.baseUrl, this.context.config.gatewayAllowedHosts).toString(), enabled: 1, archived_at: null };
+    const health = await this.fetchGateway(candidate, 'v0/management/config', 'management', 'GET', undefined, input.managementSecret === undefined ? {} : { credential: input.managementSecret });
+    if (!health.ok) throw new HttpError(503, 'gateway_candidate_unhealthy', 'Candidate management connection failed its health check; current configuration is retained');
+    if (input.catalogSecret !== undefined || input.baseUrl !== undefined && current.catalog_secret_id) {
+      const catalog = await this.fetchGateway(candidate, 'v1/models', 'catalog', 'GET', undefined, input.catalogSecret === undefined ? {} : { credential: input.catalogSecret });
+      if (!catalog.ok || !z.union([z.object({ data: z.array(z.unknown()).max(5_000) }), z.object({ models: z.array(z.unknown()).max(5_000) })]).safeParse(catalog.body).success) throw new HttpError(503, 'gateway_candidate_catalog_unavailable', 'Candidate catalog could not be read; current configuration is retained');
+    }
+  }
+
+  async checkConnectionRollback(id: string, teamId: string, expectedRevision: number, targetRevision: number): Promise<void> {
+    this.getConnection(id, teamId);
+    const target = this.context.database.prepare('SELECT metadata_json FROM gateway_connection_revisions WHERE connection_id = ? AND revision = ?').get(id, targetRevision) as { metadata_json: string } | undefined;
+    if (!target) throw new HttpError(404, 'gateway_revision_not_found', 'Connection revision not found');
+    const metadata = GatewayConnectionMetadataSchema.parse(JSON.parse(target.metadata_json));
+    await this.checkConnectionChange(id, teamId, { expectedRevision, name: metadata.name, baseUrl: metadata.baseUrl, enabled: metadata.enabled, retentionDays: metadata.retentionDays });
+  }
+
+  updateConnection(id: string, teamId: string, raw: GatewayConnectionUpdate, actorId: string, action: 'edit' | 'archive' | 'delete' | 'rollback' | 'rotate' = 'edit', targetRevision?: number): Record<string, unknown> {
+    const input = GatewayConnectionUpdateSchema.parse(raw);
+    try {
+      this.context.database.transaction(() => {
+        const current = this.getConnection(id, teamId);
+        if (current.deleted_at) throw new HttpError(409, 'gateway_connection_deleted', 'Deleted connections retain history and cannot be changed');
+        if (current.revision !== input.expectedRevision) throw new HttpError(409, 'gateway_revision_conflict', 'Connection changed; reload before applying edits');
+        this.saveRevision(current, 'baseline');
+        let metadata = { ...this.metadata(current), ...Object.fromEntries(Object.entries(input).filter(([key, value]) => ['name', 'baseUrl', 'enabled', 'retentionDays'].includes(key) && value !== undefined)) } as GatewayConnectionMetadata;
+        if (action === 'rollback') {
+          const revision = this.context.database.prepare('SELECT metadata_json FROM gateway_connection_revisions WHERE connection_id = ? AND revision = ?').get(id, targetRevision) as { metadata_json: string } | undefined;
+          if (!revision) throw new HttpError(404, 'gateway_revision_not_found', 'Connection revision not found');
+          metadata = GatewayConnectionMetadataSchema.parse(JSON.parse(revision.metadata_json));
+          if (metadata.deletedAt) throw new HttpError(409, 'gateway_revision_deleted', 'A deleted revision cannot be restored');
+        }
+        const url = validateGatewayUrl(metadata.baseUrl, this.context.config.gatewayAllowedHosts).toString();
+        const now = nowIso(this.context);
+        if (action === 'archive' || action === 'delete') { metadata.enabled = false; metadata.archivedAt = current.archived_at ?? now; }
+        if (action === 'delete') metadata.deletedAt = now;
+        if (metadata.enabled && metadata.archivedAt && action !== 'rollback') metadata.archivedAt = null;
+        let managementSecretId = current.secret_id;
+        let catalogSecretId = current.catalog_secret_id;
+        const obsolete: string[] = [];
+        if (input.managementSecret !== undefined) {
+          managementSecretId = this.storeSecret(id, this.getConnectionProviderId(id, teamId), 'management', input.managementSecret);
+          if (current.secret_id) obsolete.push(current.secret_id);
+        }
+        if (input.catalogSecret !== undefined) {
+          catalogSecretId = this.storeSecret(id, this.getConnectionProviderId(id, teamId), 'catalog', input.catalogSecret);
+          if (current.catalog_secret_id) obsolete.push(current.catalog_secret_id);
+        }
+        if (action === 'delete') { obsolete.push(...[managementSecretId, catalogSecretId].filter((value): value is string => value !== null)); managementSecretId = null; catalogSecretId = null; }
+        this.context.database.prepare('UPDATE gateway_connections SET name = ?, base_url = ?, enabled = ?, retention_days = ?, archived_at = ?, deleted_at = ?, secret_id = ?, catalog_secret_id = ?, revision = revision + 1, status = ?, last_error_summary = NULL, updated_at = ? WHERE id = ? AND revision = ?')
+          .run(metadata.name, url, metadata.enabled ? 1 : 0, metadata.retentionDays, metadata.archivedAt, metadata.deletedAt, managementSecretId, catalogSecretId, 'unknown', now, id, input.expectedRevision);
+        this.context.database.prepare("UPDATE gateway_oauth_flows SET status = 'expired', encrypted_state_json = NULL, updated_at = ? WHERE connection_id = ? AND status IN ('pending', 'submitted')").run(now, id);
+        for (const secretId of obsolete) this.context.database.prepare('DELETE FROM provider_secrets WHERE id = ?').run(secretId);
+        if (current.provider_id) this.context.database.prepare('UPDATE providers SET name = ?, base_url = ?, enabled = ?, updated_at = ? WHERE id = ? AND team_id = ?').run(`${metadata.name} gateway`, url, metadata.enabled ? 1 : 0, now, current.provider_id, teamId);
+        this.saveRevision(this.getConnection(id, teamId), action, actorId);
+        this.audit(actorId, `gateway.connection.${action}`, 'gateway_connection', id);
+      })();
+    } catch (error) {
+      if (error instanceof Error && error.message.includes('UNIQUE')) throw new HttpError(409, 'gateway_connection_exists', 'Gateway connection name already exists');
+      throw error;
+    }
+    return this.publicConnection(this.getConnection(id, teamId));
   }
 
   async health(id: string, teamId?: string, actorId?: string): Promise<GatewayFetchResult> {
-    const connection = this.connection(id, teamId);
+    const connection = this.getConnection(id, teamId);
     const now = nowIso(this.context);
     let result: GatewayFetchResult;
     try {
       result = await this.fetchManagement(connection, 'v0/management/config');
     } catch (error) {
+      if (this.getConnection(id, teamId).revision !== connection.revision) throw error;
       this.context.database.transaction(() => {
         this.context.database.prepare('UPDATE gateway_connections SET status = ?, last_checked_at = ?, last_error_summary = ?, updated_at = ? WHERE id = ?').run('unavailable', now, error instanceof HttpError ? error.message : 'Gateway request failed', now, id);
         this.audit(actorId, 'gateway.connection.health', 'gateway_connection', id, 'failed');
@@ -601,11 +744,12 @@ export class GatewayService {
       this.context.database.prepare('UPDATE gateway_connections SET status = ?, last_checked_at = ?, last_error_summary = ?, updated_at = ? WHERE id = ?').run(result.ok ? 'healthy' : 'degraded', now, result.ok ? null : `HTTP ${result.status}`, now, id);
       this.audit(actorId, 'gateway.connection.health', 'gateway_connection', id, result.ok ? 'allowed' : 'failed');
     })();
-    return result;
+    return { ok: result.ok, status: result.status, body: null };
   }
 
-  async sync(id: string, teamId?: string, options: { includeUsageQueue?: boolean } = {}, actorId?: string): Promise<IngestResult & { health: GatewayFetchResult }> {
-    const connection = this.connection(id, teamId);
+  async sync(id: string, teamId?: string, options: { includeUsageQueue?: boolean; acceptDataLoss?: boolean } = {}, actorId?: string): Promise<IngestResult & { health: GatewayFetchResult }> {
+    const connection = this.getConnection(id, teamId);
+    if (options.includeUsageQueue && !options.acceptDataLoss) throw new HttpError(422, 'gateway_queue_data_loss_consent_required', 'Queue reads cannot be recovered; explicitly accept data loss before consuming');
     const now = nowIso(this.context);
     let health: GatewayFetchResult;
     let result: IngestResult = { received: 0, inserted: 0, duplicates: 0, accountUpdates: 0, requestHashes: [] };
@@ -626,6 +770,7 @@ export class GatewayService {
         }
       }
     } catch (error) {
+      if (this.getConnection(id, teamId).revision !== connection.revision) throw error;
       this.context.database.transaction(() => {
         this.context.database.prepare('UPDATE gateway_connections SET status = ?, last_checked_at = ?, last_error_summary = ?, updated_at = ? WHERE id = ?').run('unavailable', now, error instanceof HttpError ? error.message : 'Gateway sync failed', now, id);
         this.audit(actorId, 'gateway.connection.sync', 'gateway_connection', id, 'failed');
@@ -662,41 +807,93 @@ export class GatewayService {
       }
       throw error;
     }
-    return { ...result, health };
+    return { ...result, health: { ok: health.ok, status: health.status, body: null } };
+  }
+
+  private async fetchGateway(connection: DbConnectionRow, path: string, kind: 'management' | 'catalog', method = 'GET', payload?: unknown, candidate?: { credential?: string }): Promise<GatewayFetchResult> {
+    this.assertActive(connection);
+    let base: URL;
+    try { base = validateGatewayUrl(connection.base_url, this.context.config.gatewayAllowedHosts); } catch { throw new HttpError(503, 'gateway_url_not_allowed', 'Stored gateway URL is no longer allowed'); }
+    base.pathname = base.pathname.replace(/\/(?:v0\/management|v1)\/?$/, '');
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const credential = candidate?.credential ?? this.secret(connection, kind);
+      const knownSecrets = [credential, ...(kind === 'catalog' && connection.secret_id ? [this.secret(connection, 'management')] : [])].filter((value): value is string => !!value);
+      const result = await Promise.race([
+        (async () => {
+          const response = await this.#fetch(joinUrl(base.toString(), path), {
+            method,
+            headers: { ...(credential ? { authorization: `Bearer ${credential}` } : {}), accept: 'application/json', ...(payload === undefined ? {} : { 'content-type': 'application/json' }) },
+            ...(payload === undefined ? {} : { body: JSON.stringify(payload) }),
+            signal: controller.signal, redirect: 'manual',
+          });
+          if (response.status >= 300 && response.status < 400) throw new HttpError(503, 'gateway_redirect_denied', 'Gateway redirects are not followed');
+          const textBody = await readBoundedResponse(response);
+          let body: unknown = textBody;
+          try { body = textBody ? JSON.parse(textBody) as unknown : null; } catch { body = textBody; }
+          const version = response.headers.get('X-CPA-VERSION');
+          return { ok: response.ok, status: response.status, ...(version && /^[A-Za-z0-9._+-]{1,80}$/.test(version) && stripKnownSecrets(version, knownSecrets) === version ? { upstreamVersion: version } : {}), body: stripKnownSecrets(body, knownSecrets) };
+        })(),
+        new Promise<never>((_, reject) => { timer = setTimeout(() => { controller.abort(); reject(new HttpError(503, 'gateway_unavailable', 'Gateway request timed out')); }, this.#timeoutMs); }),
+      ]);
+      const current = this.getConnection(connection.id, connection.team_id);
+      if (current.revision !== connection.revision) throw new HttpError(409, 'gateway_revision_conflict', 'Connection changed during the request; refresh again');
+      if (!candidate) this.assertActive(current);
+      return result;
+    } catch (error) {
+      if (error instanceof HttpError) throw error;
+      throw new HttpError(503, 'gateway_unavailable', 'Gateway request failed');
+    } finally { controller.abort(); if (timer) clearTimeout(timer); }
   }
 
   private async fetchManagement(connection: DbConnectionRow, path: string): Promise<GatewayFetchResult> {
-    let base: URL;
-    try { base = validateGatewayUrl(connection.base_url, this.context.config.gatewayAllowedHosts); } catch { throw new HttpError(503, 'gateway_url_not_allowed', 'Stored gateway URL is no longer allowed'); }
-    const controller = new AbortController();
-    const timeoutError = new Error('gateway timeout');
-    timeoutError.name = 'GatewayTimeout';
-    const timer = setTimeout(() => controller.abort(), this.#timeoutMs);
-    let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
-    try {
-      const response = await Promise.race([
-        this.#fetch(joinUrl(base.toString(), path), {
-          method: 'GET',
-          headers: { authorization: `Bearer ${this.secret(connection)}`, accept: 'application/json' },
-          signal: controller.signal,
-          redirect: 'manual',
-        }),
-        new Promise<never>((_, reject) => { timeoutTimer = setTimeout(() => reject(timeoutError), this.#timeoutMs); }),
-      ]);
-      if (response.status >= 300 && response.status < 400) throw new HttpError(503, 'gateway_redirect_denied', 'Gateway redirects are not followed');
-      const textBody = await readBoundedResponse(response);
-      let body: unknown = textBody;
-      try { body = textBody ? JSON.parse(textBody) as unknown : null; } catch { body = textBody; }
-      return { ok: response.ok, status: response.status, body: redactValue(body) };
-    } catch (error) {
-      if (error instanceof HttpError) throw error;
-      const message = error instanceof Error && (error.name === 'AbortError' || error.name === 'GatewayTimeout') ? 'Gateway request timed out' : 'Gateway request failed';
-      throw new HttpError(503, 'gateway_unavailable', message);
-    } finally { clearTimeout(timer); if (timeoutTimer) clearTimeout(timeoutTimer); }
+    return this.fetchGateway(connection, path, 'management');
+  }
+
+  async fetchCatalog(id: string, teamId: string, clientVersion?: string): Promise<GatewayFetchResult> {
+    const version = clientVersion === undefined ? undefined : z.string().trim().min(1).max(120).parse(clientVersion);
+    return this.fetchGateway(this.getConnection(id, teamId), `v1/models${version ? `?client_version=${encodeURIComponent(version)}` : ''}`, 'catalog');
+  }
+
+  async readManagement(id: string, teamId: string, resource: 'config' | 'accounts'): Promise<GatewayFetchResult> {
+    return this.fetchGateway(this.getConnection(id, teamId), resource === 'config' ? 'v0/management/config' : 'v0/management/auth-files', 'management');
+  }
+
+  async readManagementSetting(id: string, teamId: string, key: GatewaySettingKey): Promise<GatewayFetchResult> {
+    return this.fetchGateway(this.getConnection(id, teamId), `v0/management/${GatewaySettingKeySchema.parse(key)}`, 'management');
+  }
+
+  async writeManagementSetting(id: string, teamId: string, key: GatewaySettingKey, value: number | string): Promise<GatewayFetchResult> {
+    const setting = GatewaySettingKeySchema.parse(key);
+    return this.fetchGateway(this.getConnection(id, teamId), `v0/management/${setting}`, 'management', 'PUT', { value });
+  }
+
+  async setAccountDisabled(id: string, teamId: string, name: string, authIndex: string, disabled: boolean): Promise<GatewayFetchResult> {
+    return this.fetchGateway(this.getConnection(id, teamId), 'v0/management/auth-files/status', 'management', 'PATCH', { name, auth_index: authIndex, disabled });
+  }
+
+  async startOAuth(id: string, teamId: string, provider: 'codex' | 'anthropic' | 'antigravity'): Promise<GatewayFetchResult> {
+    const selected = z.enum(['codex', 'anthropic', 'antigravity']).parse(provider);
+    return this.fetchGateway(this.getConnection(id, teamId), `v0/management/${selected}-auth-url`, 'management');
+  }
+
+  async pollOAuth(id: string, teamId: string, state: string): Promise<GatewayFetchResult> {
+    const selected = z.string().regex(/^[a-f0-9]{32}$/).parse(state);
+    return this.fetchGateway(this.getConnection(id, teamId), `v0/management/get-auth-status?state=${selected}`, 'management');
+  }
+
+  async submitOAuth(id: string, teamId: string, provider: 'codex' | 'anthropic' | 'antigravity', state: string, code: string): Promise<GatewayFetchResult> {
+    return this.fetchGateway(this.getConnection(id, teamId), 'v0/management/oauth-callback', 'management', 'POST', { provider, state, code });
+  }
+
+  async cancelOAuth(id: string, teamId: string, state: string): Promise<GatewayFetchResult> {
+    const selected = z.string().regex(/^[a-f0-9]{32}$/).parse(state);
+    return this.fetchGateway(this.getConnection(id, teamId), `v0/management/oauth-session?state=${selected}`, 'management', 'DELETE');
   }
 
   ingest(connectionId: string, input: unknown): IngestResult {
-    const connection = this.connection(connectionId);
+    const connection = this.getConnection(connectionId);
     const records = parseCliProxyRecords(input);
     const now = nowIso(this.context);
     let inserted = 0;
@@ -714,20 +911,25 @@ export class GatewayService {
         const record = normalizeCliProxyRecord(raw, '1970-01-01T00:00:00.000Z');
         const hash = gatewayEventHash(record);
         hashes.push(hash);
+        if (this.context.database.prepare('SELECT 1 FROM gateway_request_receipts WHERE connection_id = ? AND event_hash = ?').get(connectionId, hash)) { duplicates += 1; continue; }
         let accountId: string | undefined;
         if (record.authIndex || record.account) {
           const account = record.account ?? {};
-          const existing = this.context.database.prepare('SELECT id FROM gateway_accounts WHERE connection_id = ? AND auth_index = ?').get(connectionId, record.authIndex ?? account.id ?? 'unknown') as { id: string } | undefined;
+          const existing = this.context.database.prepare('SELECT * FROM gateway_accounts WHERE connection_id = ? AND auth_index = ?').get(connectionId, record.authIndex ?? account.id ?? 'unknown') as (DbAccountRow & { masked_source: string | null; status_message: string | null }) | undefined;
           accountId = existing?.id ?? this.context.ids.id();
           const accountKey = record.authIndex ?? account.id ?? 'unknown';
-          this.context.database.prepare(`INSERT INTO gateway_accounts(id, connection_id, auth_index, provider, label, masked_source, status, status_message, quota_json, cooldown_until, observed_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(connection_id, auth_index) DO UPDATE SET provider=excluded.provider, label=excluded.label, masked_source=excluded.masked_source,
-            status=excluded.status, status_message=excluded.status_message, quota_json=excluded.quota_json, cooldown_until=excluded.cooldown_until, observed_at=excluded.observed_at`).run(
-            accountId, connectionId, accountKey, record.provider, account.label ?? null, account.source ?? null, account.status ?? 'unknown', account.statusMessage ?? null,
-            JSON.stringify(account.quota ?? {}), account.cooldownUntil ?? null, now,
-          );
-          accountUpdates += 1;
+          const hasObservation = Object.keys(account).some((key) => key !== 'id');
+          if (!existing || hasObservation && (existing.status === 'unknown' || record.occurredAt >= existing.observed_at)) {
+            this.context.database.prepare(`INSERT INTO gateway_accounts(id, connection_id, auth_index, provider, label, masked_source, status, status_message, quota_json, cooldown_until, observed_at)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              ON CONFLICT(connection_id, auth_index) DO UPDATE SET provider=excluded.provider, label=excluded.label, masked_source=excluded.masked_source,
+              status=excluded.status, status_message=excluded.status_message, quota_json=excluded.quota_json, cooldown_until=excluded.cooldown_until, observed_at=excluded.observed_at`).run(
+              accountId, connectionId, accountKey, record.provider === 'unknown' ? existing?.provider ?? 'unknown' : record.provider,
+              account.label ?? existing?.label ?? null, account.source ?? existing?.masked_source ?? null, account.status ?? existing?.status ?? 'unknown', account.statusMessage ?? existing?.status_message ?? null,
+              account.quota === undefined ? existing?.quota_json ?? '{}' : JSON.stringify(account.quota), account.cooldownUntil ?? existing?.cooldown_until ?? null, hasObservation ? record.occurredAt : now,
+            );
+            accountUpdates += 1;
+          }
         }
         const correlation = this.correlate(record, connection.team_id);
         const cost = this.costFor(connectionId, record);
@@ -760,7 +962,8 @@ export class GatewayService {
 
   private costFor(connectionId: string, record: NormalizedGatewayRequest): number | null {
     const overrides = this.listPriceOverrides(connectionId);
-    if (!overrides.length && record.estimatedCostMicrousd === undefined) return null;
+    const selected = selectPriceOverride(record.model, record.occurredAt, record.serviceTier, record.contextTokens, overrides);
+    if (!selected || (record.inputTokens > 0 && selected.promptMicrousdPerMillion === null) || (record.outputTokens > 0 && selected.completionMicrousdPerMillion === null) || (record.cachedTokens > 0 && selected.cacheReadMicrousdPerMillion === null) || (record.cacheCreationTokens > 0 && selected.cacheCreateMicrousdPerMillion === null)) return record.estimatedCostMicrousd ?? null;
     return calculateGatewayCostMicrousd(record, overrides, { promptMicrousdPerMillion: 0, completionMicrousdPerMillion: 0, cacheReadMicrousdPerMillion: 0, cacheCreateMicrousdPerMillion: 0 });
   }
 
@@ -834,7 +1037,7 @@ export class GatewayService {
     if (ids && !ids.length) return [];
     const selected = connectionId ? [connectionId] : ids;
     const rows = (selected ? this.context.database.prepare(`SELECT * FROM gateway_accounts WHERE connection_id IN (${selected.map(() => '?').join(',')}) ORDER BY provider, auth_index`).all(...selected) : this.context.database.prepare('SELECT * FROM gateway_accounts ORDER BY provider, auth_index').all()) as DbAccountRow[];
-    return rows.map((row) => ({ id: row.id, authIndex: row.auth_index, provider: row.provider, label: row.label, status: row.status, quota: parseObject(row.quota_json), cooldownUntil: row.cooldown_until }));
+    return rows.map((row) => ({ id: row.id, connectionId: row.connection_id, disabled: row.disabled === 1, managementSupported: row.management_supported === 1, observedAt: row.observed_at, authIndex: row.auth_index, provider: row.provider, label: row.label, status: row.status, quota: parseObject(row.quota_json), cooldownUntil: row.cooldown_until }));
   }
 
   summary(connectionId?: string, teamId?: string): GatewaySummary {
@@ -857,9 +1060,11 @@ export class GatewayService {
     };
   }
 
-  createPriceOverride(teamId: string, input: GatewayPriceOverrideInput, actorId: string): PriceOverride {
+  createPriceOverride(teamId: string, raw: GatewayPriceOverrideInput, actorId: string): PriceOverride {
+    const parsed = GatewayPriceOverrideSchema.parse(raw);
+    const input = { ...parsed, effectiveFrom: new Date(parsed.effectiveFrom).toISOString() };
     if (!input.connectionId) throw new HttpError(422, 'connection_required', 'A gateway connection is required');
-    this.connection(input.connectionId, teamId);
+    this.getConnection(input.connectionId, teamId);
     const id = this.context.ids.id();
     const now = nowIso(this.context);
     this.context.database.transaction(() => {
@@ -886,23 +1091,23 @@ function parseObject(value: string): Record<string, unknown> {
   try { return asRecord(JSON.parse(value)); } catch { return {}; }
 }
 
-function requestView(row: DbRequestRow): GatewayRequestView {
+export function requestView(row: DbRequestRow): GatewayRequestView {
   return { id: row.id, eventHash: row.event_hash, schemaVersion: row.schema_version, requestId: row.request_id, occurredAt: row.occurred_at, provider: row.provider, model: row.model, requestedModel: row.requested_model, accountId: row.account_id, authIndex: row.auth_index, endpoint: row.endpoint, statusCode: row.status_code, failed: row.failed === 1, failureCategory: row.failure_category, failureSummary: row.failure_summary, durationMs: row.duration_ms, ttftMs: row.ttft_ms, inputTokens: row.input_tokens, outputTokens: row.output_tokens, reasoningTokens: row.reasoning_tokens, cachedTokens: row.cached_tokens, cacheCreationTokens: row.cache_creation_tokens, estimatedCostMicrousd: row.estimated_cost_microusd, sessionId: row.session_id, projectId: row.project_id, correlationConfidence: row.correlation_confidence, correlationReason: row.correlation_reason, metadata: parseObject(row.redacted_metadata_json) };
 }
 
-function user(c: Context): AuthenticatedUser {
+export function user(c: Context): AuthenticatedUser {
   const value = c.get('user' as never) as AuthenticatedUser | undefined;
   if (!value) throw new HttpError(401, 'authentication_required', 'Authentication required');
   return value;
 }
 
-function admin(c: Context): AuthenticatedUser {
+export function admin(c: Context): AuthenticatedUser {
   const value = user(c);
   if (value.role !== 'administrator') throw new HttpError(403, 'administrator_required', 'Administrator role required');
   return value;
 }
 
-async function route<T>(c: Context, action: () => Promise<T> | T, status = 200): Promise<Response> {
+export async function route<T>(c: Context, action: () => Promise<T> | T, status = 200): Promise<Response> {
   try { return c.json(await action(), status as 200 | 201); } catch (error) {
     if (error instanceof HttpError) return c.json({ error: { code: error.code, message: error.message } }, error.status);
     return c.json({ error: { code: 'internal_error', message: 'Request failed' } }, 500);
@@ -916,12 +1121,16 @@ export const CLIProxyFixtureRecords = [
 
 export const gatewayModule: DholeModule = {
   id: 'gateway',
+  start: startGatewayRetention,
   register(app: DholeApp, context: ServerContext): void {
     const service = new GatewayService(context);
+    registerGatewayManagementRoutes(app, context, service);
+    registerGatewayCatalogRoutes(app, context, service);
+    registerGatewayOperationsRoutes(app, context, service);
     app.post('/api/gateway/connections', (c) => route(c, async () => { const actor = admin(c); const input = await parseJson(c, GatewayConnectionInputSchema); return service.createConnection(actor.teamId, input, actor.id); }, 201));
     app.get('/api/gateway/connections', (c) => route(c, () => { const actor = user(c); return service.listConnections(actor.teamId); }));
     app.post('/api/gateway/connections/:id/health', (c) => route(c, async () => { const actor = user(c); return service.health(c.req.param('id'), actor.teamId, actor.id); }));
-    app.post('/api/gateway/connections/:id/sync', (c) => route(c, async () => { const actor = user(c); const includeUsageQueue = c.req.query('includeUsageQueue') === 'true'; return service.sync(c.req.param('id'), actor.teamId, { includeUsageQueue }, actor.id); }));
+    app.post('/api/gateway/connections/:id/sync', (c) => route(c, async () => { const includeUsageQueue = c.req.query('includeUsageQueue') === 'true'; const actor = includeUsageQueue ? admin(c) : user(c); const acceptDataLoss = c.req.query('acceptDataLoss') === 'true'; return service.sync(c.req.param('id'), actor.teamId, { includeUsageQueue, acceptDataLoss }, actor.id); }));
     app.post('/api/gateway/connections/:id/ingest', (c) => route(c, async () => { const actor = admin(c); const body = await parseJson(c, z.unknown()); service.assertConnection(c.req.param('id'), actor.teamId); return service.ingest(c.req.param('id'), body); }, 201));
     app.get('/api/gateway/requests', (c) => route(c, () => {
       const actor = user(c);

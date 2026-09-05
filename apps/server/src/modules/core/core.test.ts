@@ -1,10 +1,11 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { Hono } from 'hono';
 import { loadConfig } from '../../lib/config.js';
 import { systemClock, secureIds } from '../../lib/clock.js';
 import { EventStore } from '../../lib/events.js';
 import { openDatabase } from '../../lib/database.js';
 import type { AppEnvironment, ServerContext } from '../../lib/module.js';
+import * as security from '../../lib/security.js';
 import { coreModule, requireSessionParticipant } from './core.js';
 
 function setup() {
@@ -36,7 +37,82 @@ function cookies(response: Response): string {
   return [session, csrf].filter(Boolean).join('; ');
 }
 
+function seedSession(context: ServerContext) {
+  const userId = secureIds.id();
+  const teamId = secureIds.id();
+  const token = secureIds.token(32);
+  const csrfToken = secureIds.token(24);
+  const now = new Date().toISOString();
+  context.database.prepare('INSERT INTO teams(id, name, created_at) VALUES (?, ?, ?)').run(teamId, 'Stream test', now);
+  context.database.prepare('INSERT INTO users(id, email, display_name, password_hash, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)')
+    .run(userId, 'stream@example.test', 'Stream test', 'unused fixture hash', now, now);
+  context.database.prepare('INSERT INTO team_members(team_id,user_id,role,created_at) VALUES (?,?,?,?)').run(teamId, userId, 'administrator', now);
+  context.database.prepare('INSERT INTO web_sessions(id,user_id,token_hash,csrf_hash,created_at,last_seen_at,expires_at) VALUES (?,?,?,?,?,?,?)')
+    .run(secureIds.id(), userId, security.hashToken(token), security.hashToken(csrfToken), now, now, new Date(Date.now() + 60_000).toISOString());
+  return { userId, teamId, headers: { cookie: `dhole_session=${token}`, 'x-csrf-token': csrfToken, 'content-type': 'application/json' } };
+}
+
+function delayedJson(value: unknown) {
+  let markReading!: () => void;
+  const reading = new Promise<void>((resolve) => { markReading = resolve; });
+  let release!: () => void;
+  const body = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      markReading();
+      return new Promise<void>((resolve) => {
+        release = () => {
+          controller.enqueue(new TextEncoder().encode(JSON.stringify(value)));
+          controller.close();
+          resolve();
+        };
+      });
+    },
+  }, { highWaterMark: 0 });
+  return { body, reading, finish: () => release() };
+}
+
 describe('core authentication and project boundary', () => {
+  it.each(['revoked', 'expired', 'disabled', 'role', 'team'] as const)('rejects a cookie mutation when its %s authorization changes while reading JSON', async (change) => {
+    const { app, context } = setup();
+    const actor = seedSession(context);
+    const delayed = delayedJson({ name: 'must not be created' });
+    const init: RequestInit & { duplex: 'half' } = { method: 'POST', headers: actor.headers, body: delayed.body, duplex: 'half' };
+    const response = app.request('/api/projects', init);
+    await delayed.reading;
+    if (change === 'revoked') context.database.prepare('UPDATE web_sessions SET revoked_at = created_at').run();
+    if (change === 'expired') context.database.prepare("UPDATE web_sessions SET expires_at = '2000-01-01T00:00:00.000Z'").run();
+    if (change === 'disabled') context.database.prepare('UPDATE users SET disabled_at = created_at WHERE id = ?').run(actor.userId);
+    if (change === 'role') context.database.prepare("UPDATE team_members SET role = 'member' WHERE user_id = ?").run(actor.userId);
+    if (change === 'team') {
+      const teamId = secureIds.id();
+      context.database.prepare('INSERT INTO teams(id,name,created_at) VALUES (?,?,?)').run(teamId, 'Other team', new Date().toISOString());
+      context.database.prepare('UPDATE team_members SET team_id = ? WHERE user_id = ?').run(teamId, actor.userId);
+    }
+    delayed.finish();
+    expect((await response).status).toBe(401);
+    expect(context.database.prepare('SELECT count(*) AS count FROM projects').get()).toEqual({ count: 0 });
+    context.database.close();
+  });
+
+  it('allows fresh password login when an attached older session expires during the request', async () => {
+    const { app, context } = setup();
+    const actor = seedSession(context);
+    const verifier = vi.spyOn(security, 'verifyPassword').mockResolvedValue(true);
+    try {
+      const delayed = delayedJson({ email: 'stream@example.test', password: 'a supplied account password' });
+      const init: RequestInit & { duplex: 'half' } = { method: 'POST', headers: actor.headers, body: delayed.body, duplex: 'half' };
+      const response = app.request('/api/auth/login', init);
+      await delayed.reading;
+      context.database.prepare('UPDATE web_sessions SET revoked_at = created_at').run();
+      delayed.finish();
+      expect((await response).status).toBe(200);
+      expect(context.database.prepare('SELECT count(*) AS count FROM web_sessions WHERE revoked_at IS NULL').get()).toEqual({ count: 1 });
+    } finally {
+      verifier.mockRestore();
+      context.database.close();
+    }
+  });
+
   it('bootstraps an administrator, creates a member, and enforces CSRF and role checks', async () => {
     const { app } = setup();
     const bootstrap = await json(app, '/api/auth/bootstrap', {
@@ -116,22 +192,31 @@ describe('core authentication and project boundary', () => {
     expect(invalidTypeLogin.body.error.code).toBe('invalid_content_type');
   });
 
-  it('does not trust forwarding headers for authentication rate limits', async () => {
-    const { app } = setup();
-    for (let attempt = 0; attempt < 10; attempt += 1) {
-      const response = await json(app, '/api/auth/login', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json', 'x-forwarded-for': `203.0.113.${attempt}` },
-        body: JSON.stringify({ email: 'missing@example.test', password: 'wrong password' }),
-      });
-      expect(response.response.status).toBe(401);
+  it('limits accounts and sources independently without trusting forwarding headers', async () => {
+    // Password hashing has separate checks; exercise both limiter buckets without
+    // making forty production-cost KDF calls compete with the parallel suite.
+    const verifier = vi.spyOn(security, 'verifyPassword').mockResolvedValue(false);
+    try {
+      for (const scope of ['account', 'source'] as const) {
+        const { app } = setup();
+        const limit = scope === 'account' ? 10 : 30;
+        for (let attempt = 0; attempt <= limit; attempt += 1) {
+          const response = await json(app, '/api/auth/login', {
+            method: 'POST',
+            headers: {
+              'content-type': 'application/json',
+              'x-forwarded-for': `203.0.113.${attempt}`,
+              forwarded: `for=198.51.100.${attempt}`,
+            },
+            body: JSON.stringify({ email: `${scope === 'account' ? 'missing' : `missing-${attempt}`}@example.test`, password: 'wrong password' }),
+          });
+          expect(response.response.status).toBe(attempt < limit ? 401 : 429);
+        }
+      }
+      expect(verifier).toHaveBeenCalledTimes(40);
+    } finally {
+      verifier.mockRestore();
     }
-    const limited = await json(app, '/api/auth/login', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', 'x-forwarded-for': '198.51.100.200' },
-      body: JSON.stringify({ email: 'missing@example.test', password: 'wrong password' }),
-    });
-    expect(limited.response.status).toBe(429);
   });
 
   it('permits only one concurrent administrator bootstrap', async () => {

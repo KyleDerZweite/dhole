@@ -1,4 +1,3 @@
-import { createHash } from 'node:crypto';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { Hono } from 'hono';
 import { hashToken } from '../../lib/security.js';
@@ -6,9 +5,10 @@ import { openDatabase, type DatabaseConnection } from '../../lib/database.js';
 import { EventStore } from '../../lib/events.js';
 import { secureIds, systemClock } from '../../lib/clock.js';
 import type { DholeApp, ServerContext } from '../../lib/module.js';
-import { createBenchmarkInvocationService } from '../lab/index.js';
-import { createSkillBenchmarkFixture } from '../lab/types.js';
 import { mcpModule } from './index.js';
+import { createCoordinationService } from '../coordination/service.js';
+import { registerCoordinationRoutes } from '../coordination/routes.js';
+import { coreModule } from '../core/index.js';
 
 type McpFixture = { context: ServerContext; token: string; projectId: string; otherProjectId: string; userId: string; database: DatabaseConnection };
 
@@ -54,6 +54,18 @@ function insertRunPair(fixture: McpFixture): { runId: string; otherRunId: string
 
 async function request(app: DholeApp, token: string, body: unknown, headers: Record<string, string> = {}): Promise<Response> {
   return await app.request('/mcp', { method: 'POST', headers: { authorization: `Bearer ${token}`, origin: 'http://127.0.0.1:4173', accept: 'application/json', 'content-type': 'application/json', 'MCP-Protocol-Version': '2026-07-28', ...headers }, body: JSON.stringify(body) });
+}
+
+async function registerSession(app: DholeApp, token: string, args: Record<string, unknown> = {}): Promise<{ id: string; capability: string }> {
+  const response = await request(app, token, { jsonrpc: '2.0', id: 'register', method: 'tools/call', params: { name: 'coordination_session_register', arguments: { agentLabel: 'mcp-test', ...args } } });
+  const body = await response.json();
+  expect(body.error).toBeUndefined();
+  return body.result.structuredContent;
+}
+
+async function coordinationCall(app: DholeApp, token: string, name: string, args: Record<string, unknown>, capability?: string) {
+  const response = await request(app, token, { jsonrpc: '2.0', id: name, method: 'tools/call', params: { name, arguments: args } }, capability ? { 'x-mediation-session': capability } : {});
+  return response.json();
 }
 
 describe('MCP stateless Streamable HTTP boundary', () => {
@@ -102,53 +114,88 @@ describe('MCP stateless Streamable HTTP boundary', () => {
     expect(tools.some((tool) => tool.name.includes('shell'))).toBe(false);
   });
 
-  it('invokes a bounded benchmark synchronously through the Lab service', async () => {
-    const benchmark = createBenchmarkInvocationService(context).createBenchmark({ ...createSkillBenchmarkFixture(), projectId });
-    const benchmarkToken = issueToken(context, projectId, userId, ['benchmarks:run']);
-    const response = await request(app, benchmarkToken, {
-      jsonrpc: '2.0',
-      id: 'benchmark',
-      method: 'tools/call',
-      params: {
-        name: 'benchmark_invoke',
-        arguments: { benchmarkId: benchmark.id, baselineConfig: { apiToken: 'secret' }, candidateConfig: {}, seed: 'mcp-seed' },
-      },
-    });
-    expect(response.status).toBe(200);
-    const body = await response.json() as { result?: { structuredContent?: { run: { benchmarkId: string; state: string; seed: string }; definitions: { id: string }; ordering: { balanced: string[] } } }; error?: unknown };
-    expect(body.error).toBeUndefined();
-    expect(body.result?.structuredContent).toMatchObject({
-      run: { benchmarkId: benchmark.id, state: 'completed', seed: 'mcp-seed' },
-      definitions: { id: benchmark.id },
-      ordering: { balanced: expect.any(Array) },
-    });
-    const runId = body.result?.structuredContent?.run && (body.result.structuredContent.run as { id?: string }).id;
-    expect(runId).toEqual(expect.any(String));
-    expect(database.prepare('SELECT state FROM benchmark_runs WHERE id = ?').get(runId)).toEqual({ state: 'completed' });
-    expect(database.prepare("SELECT event_kind, aggregate_id FROM event_log WHERE event_kind = 'benchmark.completed' AND aggregate_id = ?").get(runId)).toEqual({ event_kind: 'benchmark.completed', aggregate_id: runId });
-    expect(JSON.stringify(body.result?.structuredContent?.run)).not.toContain('secret');
+  it('omits retired tools and keeps Core sessions available independently of optional modules', async () => {
+    context.enabledModules = new Set(['core', 'access', 'coordination', 'mcp']);
+    const broadToken = issueToken(context, projectId, userId, ['project:read', 'coordination:write', 'children:write', 'memory:read', 'memory:propose', 'skills:read', 'skills:propose', 'benchmarks:run']);
+    insertRunPair({ context, token, projectId, otherProjectId, userId, database });
+    const prepare = vi.spyOn(database, 'prepare');
+    const listed = await request(app, broadToken, { jsonrpc: '2.0', id: 'modules', method: 'tools/list' });
+    const names = (await listed.json()).result.tools.map((tool: { name: string }) => tool.name) as string[];
+    expect(names).toContain('coordination_complete');
+    const disabled = ['benchmark_invoke', 'child_create', 'child_status', 'child_message', 'child_cancel', 'child_wait', 'child_collect', 'memory_read', 'memory_propose', 'skill_read', 'skill_propose'];
+    for (const name of disabled) {
+      expect(names).not.toContain(name);
+      expect((await coordinationCall(app, broadToken, name, {})).error.code).toBe(-32601);
+    }
+    const state = await coordinationCall(app, broadToken, 'project_state', {});
+    expect(state.result.structuredContent.runs).toHaveLength(2);
+    expect(state.result.structuredContent.sessions).toHaveLength(2);
+    expect(prepare.mock.calls.map(([sql]) => sql).join('\n')).not.toMatch(/FROM (?:memory_|skills|skill_|benchmarks|benchmark_|orchestration_|logical_agents)/u);
+    prepare.mockRestore();
+    context.enabledModules = new Set(['core', 'access', 'mcp']);
+    expect((await coordinationCall(app, broadToken, 'coordination_state', {})).error.code).toBe(-32601);
+    const legacy = await request(app, broadToken, { jsonrpc: '2.0', id: 'disabled-legacy', method: 'mediation_state' });
+    expect((await legacy.json()).error.code).toBe(-32601);
   });
 
-  it('reports benchmark event failures and leaves the run failed', async () => {
-    const benchmark = createBenchmarkInvocationService(context).createBenchmark({ ...createSkillBenchmarkFixture(), projectId });
-    const benchmarkToken = issueToken(context, projectId, userId, ['benchmarks:run']);
-    const append = vi.spyOn(context.events!, 'append').mockImplementation(() => { throw new Error('event store unavailable'); });
-    let response: Response;
-    try {
-      response = await request(app, benchmarkToken, {
-        jsonrpc: '2.0',
-        id: 'benchmark-event-failure',
-        method: 'tools/call',
-        params: { name: 'benchmark_invoke', arguments: { benchmarkId: benchmark.id, baselineConfig: {}, candidateConfig: {} } },
-      });
-    } finally {
-      append.mockRestore();
+  it('rejects derived tokens after their device authorization is revoked or expires', async () => {
+    const team = database.prepare('SELECT team_id FROM projects WHERE id = ?').get(projectId) as { team_id: string };
+    const deviceId = context.ids.id();
+    const now = context.clock.now().toISOString();
+    database.prepare('INSERT INTO user_device_tokens(id, user_id, team_id, machine_name, token_hash, permissions_json, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(deviceId, userId, team.team_id, 'fixture device', hashToken('local-device-fixture'), '["project:read"]', now, '2099-01-01T00:00:00.000Z');
+    database.prepare('UPDATE api_tokens SET device_token_id = ? WHERE token_hash = ?').run(deviceId, hashToken(token));
+    expect((await request(app, token, { jsonrpc: '2.0', id: 'active-device', method: 'tools/list' })).status).toBe(200);
+    database.prepare('UPDATE user_device_tokens SET revoked_at = ? WHERE id = ?').run(now, deviceId);
+    expect((await request(app, token, { jsonrpc: '2.0', id: 'revoked-device', method: 'tools/list' })).status).toBe(401);
+    database.prepare('UPDATE user_device_tokens SET revoked_at = NULL, expires_at = ? WHERE id = ?').run(now, deviceId);
+    expect((await request(app, token, { jsonrpc: '2.0', id: 'expired-device', method: 'tools/list' })).status).toBe(401);
+  });
+
+  it('authenticates native users independently of their optional GitHub link', async () => {
+    const now = context.clock.now().toISOString();
+    expect((await request(app, token, { jsonrpc: '2.0', id: 'native-identity', method: 'tools/list' })).status).toBe(200);
+    database.prepare("INSERT INTO github_identities(user_id, github_user_id, login, status, created_at, updated_at) VALUES (?, 123, 'fixture', 'pending', ?, ?)").run(userId, now, now);
+    expect((await request(app, token, { jsonrpc: '2.0', id: 'pending-link', method: 'tools/list' })).status).toBe(200);
+    database.prepare("UPDATE github_identities SET status = 'active' WHERE user_id = ?").run(userId);
+    expect((await request(app, token, { jsonrpc: '2.0', id: 'active-link', method: 'tools/list' })).status).toBe(200);
+    database.prepare("UPDATE github_identities SET status = 'disabled' WHERE user_id = ?").run(userId);
+    expect((await request(app, token, { jsonrpc: '2.0', id: 'disabled-link', method: 'tools/list' })).status).toBe(200);
+    database.prepare('DELETE FROM github_identities WHERE user_id = ?').run(userId);
+    expect((await request(app, token, { jsonrpc: '2.0', id: 'unlinked-identity', method: 'tools/list' })).status).toBe(200);
+    database.prepare('UPDATE users SET disabled_at = ? WHERE id = ?').run(now, userId);
+    expect((await request(app, token, { jsonrpc: '2.0', id: 'disabled-native-user', method: 'tools/list' })).status).toBe(401);
+  });
+
+  it('rechecks project access and removes stale write scopes when an editor becomes a viewer', async () => {
+    const now = context.clock.now().toISOString();
+    const team = database.prepare('SELECT team_id FROM projects WHERE id = ?').get(projectId) as { team_id: string };
+    const ownerId = context.ids.id();
+    database.prepare('INSERT INTO users(id, email, display_name, password_hash, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(ownerId, 'owner@example.invalid', 'Owner', 'not-a-password', now, now);
+    database.prepare("INSERT INTO team_members(team_id, user_id, role, created_at) VALUES (?, ?, 'member', ?)").run(team.team_id, ownerId, now);
+    database.prepare("UPDATE projects SET created_by = ?, visibility = 'private' WHERE id = ?").run(ownerId, projectId);
+    database.prepare("INSERT INTO project_members(project_id, user_id, role, created_by, created_at, updated_at) VALUES (?, ?, 'editor', ?, ?, ?)")
+      .run(projectId, userId, ownerId, now, now);
+    const writeToken = issueToken(context, projectId, userId, ['project:read', 'coordination:write', 'children:write', 'memory:read', 'memory:propose', 'skills:read', 'skills:propose', 'benchmarks:run']);
+    const session = await registerSession(app, writeToken);
+    const claimed = await coordinationCall(app, writeToken, 'coordination_claim', { coordinationSessionId: session.id, intent: 'editor work' }, session.capability);
+    expect(claimed.error).toBeUndefined();
+    database.prepare("UPDATE project_members SET role = 'viewer' WHERE project_id = ? AND user_id = ?").run(projectId, userId);
+    const listed = await request(app, writeToken, { jsonrpc: '2.0', id: 'viewer-catalog', method: 'tools/list' });
+    const names = (await listed.json()).result.tools.map((tool: { name: string }) => tool.name) as string[];
+    expect(names).toContain('coordination_state');
+    for (const name of ['coordination_claim', 'coordination_complete', 'coordination_release', 'coordination_session_heartbeat']) {
+      expect(names).not.toContain(name);
+      expect((await coordinationCall(app, writeToken, name, {}, session.capability)).error.code).toBe(-32003);
     }
-    expect((await response.json()).error.code).toBe(-32000);
-    const run = database.prepare('SELECT id, state FROM benchmark_runs ORDER BY created_at DESC LIMIT 1').get() as { id: string; state: string };
-    expect(run.state).toBe('failed');
-    expect(database.prepare('SELECT count(*) AS count FROM benchmark_case_runs WHERE run_id = ?').get(run.id)).toEqual({ count: 2 });
-    expect(database.prepare("SELECT count(*) AS count FROM event_log WHERE event_kind = 'benchmark.completed'").get()).toEqual({ count: 0 });
+    const legacy = await request(app, writeToken, { jsonrpc: '2.0', id: 'viewer-legacy', method: 'mediation_claim', params: { claimId: claimed.result.structuredContent.id, status: 'released' } }, { 'x-mediation-session': session.capability });
+    expect((await legacy.json()).error.code).toBe(-32003);
+    expect((await coordinationCall(app, writeToken, 'coordination_state', {})).error).toBeUndefined();
+    expect(database.prepare('SELECT status FROM coordination_claims WHERE id = ?').get(claimed.result.structuredContent.id)).toEqual({ status: 'investigating' });
+    database.prepare('DELETE FROM project_members WHERE project_id = ? AND user_id = ?').run(projectId, userId);
+    expect((await request(app, writeToken, { jsonrpc: '2.0', id: 'removed-project-access', method: 'tools/list' })).status).toBe(401);
+    expect((await request(app, writeToken, { jsonrpc: '2.0', id: 'removed-project-read', method: 'tools/call', params: { name: 'project_state', arguments: {} } })).status).toBe(401);
   });
 
   it('denies project IDOR even when the request argument names another project', async () => {
@@ -159,37 +206,122 @@ describe('MCP stateless Streamable HTTP boundary', () => {
   });
 
   it('denies a tool absent from the stored token scopes', async () => {
-    const response = await request(app, token, { jsonrpc: '2.0', id: 'scope', method: 'tools/call', params: { name: 'memory_read', arguments: {} } });
+    const response = await request(app, token, { jsonrpc: '2.0', id: 'scope', method: 'tools/call', params: { name: 'coordination_claim', arguments: {} } });
     expect((await response.json()).error.code).toBe(-32003);
   });
 
-  it('registers a coordination session, creates a claim, and exposes it in project state', async () => {
+  it('registers authenticated sessions and shares claim scope, findings and completion behavior with HTTP', async () => {
     const coordinationToken = issueToken(context, projectId, userId, ['project:read', 'coordination:write']);
-    const registerResponse = await request(app, coordinationToken, { jsonrpc: '2.0', id: 'register', method: 'tools/call', params: { name: 'coordination_session_register', arguments: { agentLabel: 'mcp-test', developerLabel: 'integration', worktreeHash: 'worktree-hash', capabilityHash: 'capability-hash', expiresInMs: 60_000 } } });
-    expect(registerResponse.status).toBe(200);
-    const registerBody = await registerResponse.json() as { result?: { structuredContent?: { id: string; projectId: string; agentLabel: string; expiresAt: string } }; error?: unknown };
-    expect(registerBody.error).toBeUndefined();
-    expect(registerBody.result?.structuredContent).toMatchObject({ projectId, agentLabel: 'mcp-test' });
-    const coordinationSessionId = registerBody.result?.structuredContent?.id;
-    expect(coordinationSessionId).toEqual(expect.any(String));
-    const sessionRow = database.prepare('SELECT project_id, user_id, agent_label, developer_label, worktree_hash, capability_hash FROM coordination_sessions WHERE id = ?').get(coordinationSessionId) as { project_id: string; user_id: string; agent_label: string; developer_label: string; worktree_hash: string; capability_hash: string };
-    expect(sessionRow).toMatchObject({ project_id: projectId, user_id: userId, agent_label: 'mcp-test', developer_label: 'integration', capability_hash: 'capability-hash' });
+    const session = await registerSession(app, coordinationToken, { developerLabel: 'untrusted label', worktree: 'checkout-a' });
+    const sessionRow = database.prepare('SELECT user_id, developer_label, worktree_hash, capability_hash FROM coordination_sessions WHERE id = ?').get(session.id) as Record<string, string>;
+    expect(sessionRow).toMatchObject({ user_id: userId, developer_label: 'MCP', capability_hash: hashToken(session.capability) });
     expect(sessionRow.worktree_hash).toMatch(/^wt_[A-Za-z0-9_-]{43}$/u);
+    const created = await coordinationCall(app, coordinationToken, 'coordination_claim', { coordinationSessionId: session.id, intent: 'initial work', files: ['before.ts'] }, session.capability);
+    expect(created.error).toBeUndefined();
+    const claimId = created.result.structuredContent.id as string;
 
-    const claimResponse = await request(app, coordinationToken, { jsonrpc: '2.0', id: 'claim', method: 'tools/call', params: { name: 'coordination_claim', arguments: { coordinationSessionId, intent: 'verify MCP claim', task: 'MCP integration', files: ['apps/server/src/modules/mcp/index.test.ts'], components: ['mcp'], summary: 'test claim' } } });
-    expect(claimResponse.status).toBe(200);
-    const claimBody = await claimResponse.json() as { result?: { structuredContent?: { id: string; projectId: string; coordinationSessionId: string; status: string; files: string[]; components: string[] } }; error?: unknown };
-    expect(claimBody.error).toBeUndefined();
-    expect(claimBody.result?.structuredContent).toMatchObject({ projectId, coordinationSessionId, status: 'investigating', files: ['apps/server/src/modules/mcp/index.test.ts'], components: ['mcp'] });
-    const claimId = claimBody.result?.structuredContent?.id;
-    expect(claimId).toEqual(expect.any(String));
-    expect(database.prepare('SELECT project_id, coordination_session_id, intent, task, status, summary FROM coordination_claims WHERE id = ?').get(claimId)).toEqual({ project_id: projectId, coordination_session_id: coordinationSessionId, intent: 'verify MCP claim', task: 'MCP integration', status: 'investigating', summary: 'test claim' });
+    const service = createCoordinationService(database, context.clock, context.ids, { events: context.events });
+    const peer = service.startSession(projectId, { agent: 'http-peer', userId, developer: 'MCP', worktree: 'checkout-b' });
+    const blocker = service.createClaim(projectId, { sessionId: peer.id, capability: peer.capability!, userId, intent: 'peer work', files: ['after.ts'] }).claim;
+    const http: DholeApp = new Hono();
+    coreModule.register(http, context);
+    http.use('*', async (c, next) => {
+      const team = database.prepare('SELECT team_id FROM projects WHERE id = ?').get(projectId) as { team_id: string };
+      c.set('user', { id: userId, email: 'mcp@example.invalid', displayName: 'MCP', role: 'member', teamId: team.team_id });
+      await next();
+    });
+    registerCoordinationRoutes(http, service);
+    const httpCheck = await http.request(`/api/projects/${projectId}/check`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ intent: 'scope check', files: ['after.ts'] }) });
+    const mcpCheck = await coordinationCall(app, coordinationToken, 'coordination_check', { intent: 'scope check', files: ['after.ts'] });
+    expect(mcpCheck.result.structuredContent.conflicts).toEqual((await httpCheck.json()).conflicts);
 
-    const stateResponse = await request(app, coordinationToken, { jsonrpc: '2.0', id: 'state', method: 'tools/call', params: { name: 'project_state', arguments: {} } });
-    expect(stateResponse.status).toBe(200);
-    const stateBody = await stateResponse.json() as { result?: { structuredContent?: { project: { id: string }; claims: Array<{ id: string; intent: string; status: string }> } }; error?: unknown };
-    expect(stateBody.error).toBeUndefined();
-    expect(stateBody.result?.structuredContent).toMatchObject({ project: { id: projectId }, claims: [expect.objectContaining({ id: claimId, intent: 'verify MCP claim', status: 'investigating' })] });
+    const updated = await coordinationCall(app, coordinationToken, 'coordination_claim', {
+      claimId, intent: 'updated work', files: ['after.ts'], components: ['MCP'], status: 'blocked', blockedOn: blocker.id,
+      finding: 'api_key=fixture-secret-value caused the failure', findingKind: 'root-cause', findingFiles: ['after.ts'], branch: 'fix/mcp', baseRevision: 'abc123',
+    }, session.capability);
+    expect(updated.result.structuredContent).toMatchObject({ blockedOn: blocker.id, status: 'blocked', scope: { intent: 'updated work', files: ['after.ts'], components: ['mcp'] }, findings: [expect.objectContaining({ kind: 'root-cause' })] });
+    expect(JSON.stringify(updated)).not.toContain('fixture-secret-value');
+    const stateResponse = await http.request(`/api/projects/${projectId}/state`);
+    const state = await stateResponse.json();
+    expect(state.claims.find((claim: { id: string }) => claim.id === claimId)).toEqual(updated.result.structuredContent);
+
+    const completed = await coordinationCall(app, coordinationToken, 'coordination_complete', { claimId, summary: 'fixed', commits: ['abc123'], prs: ['https://example.invalid/pr/1'] }, session.capability);
+    expect(completed.result.structuredContent).toMatchObject({ status: 'done', commits: ['abc123'], prs: ['https://example.invalid/pr/1'], summary: 'fixed' });
+    const repeated = await coordinationCall(app, coordinationToken, 'coordination_complete', { claimId, commits: ['def456'], prs: ['https://example.invalid/pr/2'] }, session.capability);
+    expect(repeated.result.structuredContent).toMatchObject({ commits: ['abc123', 'def456'], prs: ['https://example.invalid/pr/1', 'https://example.invalid/pr/2'] });
+    const snapshot = await coordinationCall(app, coordinationToken, 'coordination_state', {});
+    expect(snapshot.result.structuredContent.completed).toContainEqual(repeated.result.structuredContent);
+    const events = database.prepare('SELECT payload_json FROM event_log WHERE project_id = ?').all(projectId);
+    expect(JSON.stringify([updated, completed, repeated, snapshot, events])).not.toContain(session.capability);
+    expect(JSON.stringify(events)).not.toContain('fixture-secret-value');
+  });
+
+  it('requires transport capability, rejects capability arguments, and does not suppress another session overlap', async () => {
+    const coordinationToken = issueToken(context, projectId, userId, ['project:read', 'coordination:write']);
+    const session = await registerSession(app, coordinationToken);
+    const peer = await registerSession(app, coordinationToken);
+    const args = { coordinationSessionId: session.id, intent: 'owned work', files: ['owned.ts'] };
+    expect((await coordinationCall(app, coordinationToken, 'coordination_claim', args)).error.code).toBe(-32003);
+    expect((await coordinationCall(app, coordinationToken, 'coordination_claim', args, peer.capability)).error.code).toBe(-32003);
+    expect((await coordinationCall(app, coordinationToken, 'coordination_claim', { ...args, capability: session.capability }, session.capability)).error.code).toBe(-32602);
+    const created = await coordinationCall(app, coordinationToken, 'coordination_claim', args, session.capability);
+    expect(created.error).toBeUndefined();
+    const ignoredMode = await coordinationCall(app, coordinationToken, 'coordination_claim', { claimId: created.result.structuredContent.id, mode: 'enforced' }, session.capability);
+    expect(ignoredMode.error.code).toBe(-32602);
+    const spoofed = await coordinationCall(app, coordinationToken, 'coordination_check', { coordinationSessionId: session.id, files: ['owned.ts'] }, peer.capability);
+    expect(spoofed.error.code).toBe(-32003);
+  });
+
+  it('renews repository reports, adopts unfinished work, and revives released work without changing old history', async () => {
+    const coordinationToken = issueToken(context, projectId, userId, ['project:read', 'coordination:write']);
+    const first = await registerSession(app, coordinationToken, { worktree: 'recoverable-checkout' });
+    const heartbeat = await coordinationCall(app, coordinationToken, 'coordination_session_heartbeat', { coordinationSessionId: first.id, branch: 'topic', dirtyFiles: ['dirty.ts'] }, first.capability);
+    expect(heartbeat.result.structuredContent).toMatchObject({ active: true });
+    expect(heartbeat.result.structuredContent.capability).toBeUndefined();
+    const report = await coordinationCall(app, coordinationToken, 'coordination_repo_report', { coordinationSessionId: first.id, branch: 'topic', revision: 'abc123', dirtyFiles: ['dirty.ts'] }, first.capability);
+    expect(report.result.structuredContent).toMatchObject({ branch: 'topic', revision: 'abc123', dirtyFiles: ['dirty.ts'] });
+    const created = await coordinationCall(app, coordinationToken, 'coordination_claim', { coordinationSessionId: first.id, intent: 'recover work', files: ['claimed.ts'] }, first.capability);
+    const claimId = created.result.structuredContent.id;
+    const check = await coordinationCall(app, coordinationToken, 'coordination_check', { files: ['dirty.ts'] });
+    expect(check.result.structuredContent.conflicts).toEqual([expect.objectContaining({ claimId })]);
+    expect((await coordinationCall(app, coordinationToken, 'coordination_session_end', { coordinationSessionId: first.id }, first.capability)).error).toBeUndefined();
+    const second = await registerSession(app, coordinationToken, { worktree: 'recoverable-checkout' });
+    const adopted = await coordinationCall(app, coordinationToken, 'coordination_claim', { claimId, status: 'testing' }, second.capability);
+    expect(adopted.result.structuredContent).toMatchObject({ coordinationSessionId: second.id, status: 'testing' });
+    const released = await coordinationCall(app, coordinationToken, 'coordination_release', { claimId }, second.capability);
+    expect(released.result.structuredContent.status).toBe('released');
+    const oldRow = database.prepare('SELECT * FROM coordination_claims WHERE id = ?').get(claimId);
+    const revived = await coordinationCall(app, coordinationToken, 'coordination_revive', { claimId, files: ['resumed.ts'], finding: 'resumed the work', findingKind: 'decision' }, second.capability);
+    expect(revived.result.structuredContent.claim).toMatchObject({ recoveredFromClaimId: claimId, scope: { files: ['resumed.ts'] }, status: 'investigating' });
+    expect(revived.result.structuredContent.claim.id).not.toBe(claimId);
+    expect(database.prepare('SELECT * FROM coordination_claims WHERE id = ?').get(claimId)).toEqual(oldRow);
+    const repeated = await coordinationCall(app, coordinationToken, 'coordination_revive', { claimId }, second.capability);
+    expect(repeated.result.structuredContent.claim.id).toBe(revived.result.structuredContent.claim.id);
+  });
+
+  it('keeps run-scoped lifecycle identities separate and denies all mutations outside that run', async () => {
+    const runs = insertRunPair({ context, token, projectId, otherProjectId, userId, database });
+    const projectToken = issueToken(context, projectId, userId, ['project:read', 'coordination:write']);
+    const runToken = issueToken(context, projectId, userId, ['project:read', 'coordination:write'], runs.runId);
+    const session = await registerSession(app, projectToken);
+    const outside = await coordinationCall(app, projectToken, 'coordination_claim', { coordinationSessionId: session.id, runId: runs.otherRunId, intent: 'other run' }, session.capability);
+    const claimId = outside.result.structuredContent.id;
+    for (const name of ['coordination_claim', 'coordination_complete', 'coordination_release', 'coordination_revive']) {
+      expect((await coordinationCall(app, runToken, name, { claimId }, session.capability)).error.code).toBe(-32003);
+    }
+    for (const name of ['coordination_session_heartbeat', 'coordination_session_end', 'coordination_repo_report']) {
+      expect((await coordinationCall(app, runToken, name, { coordinationSessionId: session.id }, session.capability)).error.code).toBe(-32003);
+    }
+    const native = { eventId: 'native-event', runId: 'native-run', agentId: 'native-agent', harness: 'fixture', state: 'active', occurredAt: context.clock.now().toISOString() };
+    const event = await coordinationCall(app, runToken, 'coordination_agent_event', native);
+    expect(event.error).toBeUndefined();
+    const retry = await coordinationCall(app, runToken, 'coordination_agent_event', native);
+    expect(retry.result.structuredContent.idempotent).toBe(true);
+    const state = await coordinationCall(app, runToken, 'coordination_state', {});
+    expect(state.result.structuredContent.claims).toEqual([]);
+    expect(state.result.structuredContent.agents).toHaveLength(1);
+    expect(JSON.stringify(state)).not.toContain('native-agent');
+    expect(JSON.stringify(state)).not.toContain('native-run');
   });
 
   it('rejects traversal and absolute paths at the MCP boundary', async () => {
@@ -201,184 +333,54 @@ describe('MCP stateless Streamable HTTP boundary', () => {
     expect(database.prepare('SELECT count(*) AS count FROM coordination_claims').get()).toEqual({ count: 0 });
   });
 
-  it('rejects credential-bearing memory proposal content before persistence', async () => {
-    const memoryToken = issueToken(context, projectId, userId, ['memory:propose']);
-    const packId = context.ids.id();
-    const now = context.clock.now().toISOString();
-    database.prepare('INSERT INTO memory_packs(id, project_id, stable_key, name, scope, created_at) VALUES (?, ?, \'mcp-memory\', \'MCP memory\', \'project\', ?)').run(packId, projectId, now);
-    const values = [
-      { title: 'api_key=memory-secret', body: 'safe', sourceType: 'decision', sourceReference: 'adr/1' },
-      { title: 'Architecture decision', body: 'Authorization: Bearer memory-secret', sourceType: 'decision', sourceReference: 'adr/1' },
-      { title: 'Architecture decision', body: 'safe', sourceType: 'password=hunter2', sourceReference: 'adr/1' },
-      { title: 'Architecture decision', body: 'safe', sourceType: 'decision', sourceReference: 'https://user:pass@example.test/adr/1' },
-    ] as const;
-    for (const value of values) {
-      const response = await request(app, memoryToken, { jsonrpc: '2.0', id: 'memory-secret', method: 'tools/call', params: { name: 'memory_propose', arguments: { packId, ...value } } });
-      expect((await response.json()).error.code).toBe(-32602);
-    }
-    expect(database.prepare('SELECT count(*) AS count FROM memory_proposals WHERE pack_id = ?').get(packId)).toEqual({ count: 0 });
-  });
-
-  it('records secret-free memory proposal audit evidence atomically', async () => {
-    const memoryToken = issueToken(context, projectId, userId, ['memory:propose']);
-    const packId = context.ids.id();
-    const now = context.clock.now().toISOString();
-    database.prepare('INSERT INTO memory_packs(id, project_id, stable_key, name, scope, created_at) VALUES (?, ?, \'mcp-memory-audit\', \'MCP memory audit\', \'project\', ?)').run(packId, projectId, now);
-    const response = await request(app, memoryToken, { jsonrpc: '2.0', id: 'memory-audit', method: 'tools/call', params: { name: 'memory_propose', arguments: { packId, title: 'Use SQLite', body: 'Keep durable decisions local', sourceType: 'decision', sourceReference: 'adr/1', baseGenerationId: undefined } } });
-    const body = await response.json() as { result?: { structuredContent?: { proposalId: string; packId: string; state: string } }; error?: unknown };
-    expect(body.error).toBeUndefined();
-    const result = body.result?.structuredContent;
-    expect(result).toMatchObject({ packId, state: 'pending', proposalId: expect.any(String) });
-    const audit = database.prepare("SELECT actor_type, actor_id, action, target_type, target_id, outcome, detail_json FROM audit_records WHERE action = 'memory.propose' AND target_id = ?").get(result?.proposalId) as { actor_type: string; actor_id: string; action: string; target_type: string; target_id: string; outcome: string; detail_json: string };
-    expect(audit).toMatchObject({ actor_type: 'user', actor_id: userId, action: 'memory.propose', target_type: 'memory_proposal', target_id: result?.proposalId, outcome: 'allowed' });
-    expect(JSON.parse(audit.detail_json)).toEqual({ packId, baseGenerationId: null, sourceType: 'decision' });
-    expect(audit.detail_json).not.toContain('Keep durable decisions local');
-    expect(database.prepare("SELECT aggregate_type, aggregate_id, payload_json FROM event_log WHERE event_kind = 'memory.proposed' AND aggregate_id = ?").get(packId)).toMatchObject({ aggregate_type: 'memory_pack', aggregate_id: packId });
-  });
-
-  it('rolls back a memory proposal and event when its audit insert fails', async () => {
-    const memoryToken = issueToken(context, projectId, userId, ['memory:propose']);
-    const packId = context.ids.id();
-    const now = context.clock.now().toISOString();
-    database.prepare('INSERT INTO memory_packs(id, project_id, stable_key, name, scope, created_at) VALUES (?, ?, \'mcp-memory-rollback\', \'MCP memory rollback\', \'project\', ?)').run(packId, projectId, now);
-    database.exec(`CREATE TRIGGER fail_mcp_memory_audit BEFORE INSERT ON audit_records
-      WHEN NEW.action = 'memory.propose' BEGIN SELECT RAISE(ABORT, 'audit unavailable'); END`);
-    const response = await request(app, memoryToken, { jsonrpc: '2.0', id: 'memory-rollback', method: 'tools/call', params: { name: 'memory_propose', arguments: { packId, title: 'Rollback', body: 'Must not persist', sourceType: 'decision', sourceReference: 'adr/rollback' } } });
-    expect((await response.json()).error.code).toBe(-32000);
-    expect(database.prepare('SELECT count(*) AS count FROM memory_proposals WHERE pack_id = ?').get(packId)).toEqual({ count: 0 });
-    expect(database.prepare("SELECT count(*) AS count FROM event_log WHERE event_kind = 'memory.proposed' AND aggregate_id = ?").get(packId)).toEqual({ count: 0 });
-  });
-
   it('rolls back a claim when its durable event cannot be appended', async () => {
     const coordinationToken = issueToken(context, projectId, userId, ['project:read', 'coordination:write']);
-    const registerResponse = await request(app, coordinationToken, { jsonrpc: '2.0', id: 'register-before-failure', method: 'tools/call', params: { name: 'coordination_session_register', arguments: { agentLabel: 'mcp-test' } } });
-    const registerBody = await registerResponse.json() as { result: { structuredContent: { id: string } } };
-    const coordinationSessionId = registerBody.result.structuredContent.id;
-    const events = context.events as unknown as { append: (...args: unknown[]) => unknown };
-    const append = events.append;
-    events.append = () => { throw new Error('event store unavailable'); };
-    let response: Response;
+    const session = await registerSession(app, coordinationToken);
+    const append = vi.spyOn(context.events, 'append').mockImplementation(() => { throw new Error('event store unavailable'); });
+    let body;
     try {
-      response = await request(app, coordinationToken, { jsonrpc: '2.0', id: 'claim-event-failure', method: 'tools/call', params: { name: 'coordination_claim', arguments: { coordinationSessionId, intent: 'must roll back', files: ['rollback.ts'] } } });
+      body = await coordinationCall(app, coordinationToken, 'coordination_claim', { coordinationSessionId: session.id, intent: 'must roll back', files: ['rollback.ts'] }, session.capability);
     } finally {
-      events.append = append;
+      append.mockRestore();
     }
-    expect((await response.json()).error.code).toBe(-32000);
+    expect(body.error.code).toBe(-32000);
     expect(database.prepare('SELECT count(*) AS count FROM coordination_claims').get()).toEqual({ count: 0 });
   });
 
-  it('records an overlap conflict for claims from different sessions', async () => {
+  it('records overlap and resolves it when completion settles the claim', async () => {
     const coordinationToken = issueToken(context, projectId, userId, ['project:read', 'coordination:write']);
-    const register = async (id: string, agentLabel: string): Promise<string> => {
-      const response = await request(app, coordinationToken, { jsonrpc: '2.0', id, method: 'tools/call', params: { name: 'coordination_session_register', arguments: { agentLabel } } });
-      const body = await response.json() as { result: { structuredContent: { id: string } } };
-      return body.result.structuredContent.id;
-    };
-    const firstSessionId = await register('register-overlap-a', 'overlap-a');
-    const first = await request(app, coordinationToken, { jsonrpc: '2.0', id: 'claim-overlap-a', method: 'tools/call', params: { name: 'coordination_claim', arguments: { coordinationSessionId: firstSessionId, intent: 'first claim', files: ['shared.ts'] } } });
-    const firstBody = await first.json() as { result: { structuredContent: { id: string } } };
-    const firstClaimId = firstBody.result.structuredContent.id;
-    const secondSessionId = await register('register-overlap-b', 'overlap-b');
-    const second = await request(app, coordinationToken, { jsonrpc: '2.0', id: 'claim-overlap-b', method: 'tools/call', params: { name: 'coordination_claim', arguments: { coordinationSessionId: secondSessionId, intent: 'second claim', files: ['shared.ts'] } } });
-    const secondBody = await second.json() as {
-      result: { structuredContent: { id: string; conflicts: Array<{ claimId: string; severity: string; reasons: Array<{ type: string }> }> } };
-    };
-    expect(secondBody.result.structuredContent.conflicts).toEqual([expect.objectContaining({ claimId: firstClaimId, severity: 'blocking', reasons: [expect.objectContaining({ type: 'files' })] })]);
-    expect(database.prepare('SELECT claim_id, conflicting_claim_id, severity FROM coordination_conflicts WHERE project_id = ?').get(projectId)).toEqual({ claim_id: secondBody.result.structuredContent.id, conflicting_claim_id: firstClaimId, severity: 'blocking' });
+    const first = await registerSession(app, coordinationToken);
+    const second = await registerSession(app, coordinationToken);
+    const a = await coordinationCall(app, coordinationToken, 'coordination_claim', { coordinationSessionId: first.id, intent: 'first claim', files: ['shared.ts'] }, first.capability);
+    const claimId = a.result.structuredContent.id;
+    const b = await coordinationCall(app, coordinationToken, 'coordination_claim', { coordinationSessionId: second.id, intent: 'second claim', files: ['shared.ts'] }, second.capability);
+    expect(b.result.structuredContent.conflicts).toEqual([expect.objectContaining({ claimId, reasons: [expect.objectContaining({ type: 'files' })] })]);
+    expect(database.prepare('SELECT severity, resolved_at FROM coordination_conflicts WHERE project_id = ?').get(projectId)).toEqual({ severity: 'blocking', resolved_at: null });
+    const settled = await coordinationCall(app, coordinationToken, 'coordination_complete', { claimId, summary: 'settled' }, first.capability);
+    expect(settled.error).toBeUndefined();
+    expect(database.prepare('SELECT resolved_at FROM coordination_conflicts WHERE project_id = ?').get(projectId)).toEqual({ resolved_at: expect.any(String) });
   });
 
-  it('resolves MCP conflict rows when a terminal claim update settles the claim', async () => {
+  it('canonicalizes worktree identity while retaining overlap warnings for distinct agents in that checkout', async () => {
     const coordinationToken = issueToken(context, projectId, userId, ['project:read', 'coordination:write']);
-    const register = async (id: string, agentLabel: string): Promise<string> => {
-      const response = await request(app, coordinationToken, { jsonrpc: '2.0', id, method: 'tools/call', params: { name: 'coordination_session_register', arguments: { agentLabel } } });
-      const body = await response.json() as { result: { structuredContent: { id: string } } };
-      return body.result.structuredContent.id;
-    };
-    const firstSessionId = await register('register-settle-a', 'settle-a');
-    const first = await request(app, coordinationToken, { jsonrpc: '2.0', id: 'claim-settle-a', method: 'tools/call', params: { name: 'coordination_claim', arguments: { coordinationSessionId: firstSessionId, intent: 'first claim', files: ['settle.ts'] } } });
-    const firstBody = await first.json() as { result: { structuredContent: { id: string } } };
-    const firstClaimId = firstBody.result.structuredContent.id;
-    const secondSessionId = await register('register-settle-b', 'settle-b');
-    await request(app, coordinationToken, { jsonrpc: '2.0', id: 'claim-settle-b', method: 'tools/call', params: { name: 'coordination_claim', arguments: { coordinationSessionId: secondSessionId, intent: 'second claim', files: ['settle.ts'] } } });
-    const conflict = database.prepare('SELECT resolved_at FROM coordination_conflicts WHERE project_id = ? AND conflicting_claim_id = ?').get(projectId, firstClaimId) as { resolved_at: string | null } | undefined;
-    expect(conflict?.resolved_at).toBeNull();
-    const settle = await request(app, coordinationToken, { jsonrpc: '2.0', id: 'claim-settle-terminal', method: 'tools/call', params: { name: 'coordination_claim', arguments: { claimId: firstClaimId, status: 'done', summary: 'settled' } } });
-    expect((await settle.json()).error).toBeUndefined();
-    const resolved = database.prepare('SELECT resolved_at FROM coordination_conflicts WHERE project_id = ? AND conflicting_claim_id = ?').get(projectId, firstClaimId) as { resolved_at: string | null } | undefined;
-    expect(resolved?.resolved_at).toEqual(expect.any(String));
+    const first = await registerSession(app, coordinationToken, { worktreeHash: 'repo/checkout' });
+    const second = await registerSession(app, coordinationToken, { worktreeHash: 'repo/checkout' });
+    const a = await coordinationCall(app, coordinationToken, 'coordination_claim', { coordinationSessionId: first.id, intent: 'first worktree claim', files: ['shared.ts'] }, first.capability);
+    const b = await coordinationCall(app, coordinationToken, 'coordination_claim', { coordinationSessionId: second.id, intent: 'second worktree claim', files: ['shared.ts'] }, second.capability);
+    expect(b.result.structuredContent.conflicts).toEqual([expect.objectContaining({ claimId: a.result.structuredContent.id })]);
+    expect(a.result.structuredContent.scope.worktree).toMatch(/^wt_[A-Za-z0-9_-]{43}$/u);
+    expect(b.result.structuredContent.scope.worktree).toBe(a.result.structuredContent.scope.worktree);
   });
 
-  it('rejects credential-bearing skill markdown before persistence', async () => {
-    const skillsToken = issueToken(context, projectId, userId, ['skills:propose']);
-    const unsafe = await request(app, skillsToken, { jsonrpc: '2.0', id: 'skill-unsafe', method: 'tools/call', params: { name: 'skill_propose', arguments: { stableKey: 'unsafe-mcp-skill', skillMarkdown: '---\nname: unsafe\n---\napi_key=super-secret-value' } } });
-    expect((await unsafe.json()).error.code).toBe(-32602);
-    expect(database.prepare("SELECT count(*) AS count FROM skills WHERE project_id = ? AND stable_key = 'unsafe-mcp-skill'").get(projectId)).toEqual({ count: 0 });
-  });
-
-  it('stores skill markdown byte-identically, hashes it, and writes audit evidence atomically', async () => {
-    const skillsToken = issueToken(context, projectId, userId, ['skills:propose']);
-    const markdown = '---\nname: mcp-audited\ndescription: fixture\n---\nUse the supplied context exactly.\n';
-    const manifest = { description: 'fixture', allowedTools: ['Read'] };
-    const response = await request(app, skillsToken, { jsonrpc: '2.0', id: 'skill-audit', method: 'tools/call', params: { name: 'skill_propose', arguments: { stableKey: 'mcp-audited', skillMarkdown: markdown, manifest } } });
-    const body = await response.json() as { result?: { structuredContent?: { skillId: string; versionId: string; version: number; contentHash: string } }; error?: unknown };
-    expect(body.error).toBeUndefined();
-    const result = body.result?.structuredContent;
-    expect(result).toMatchObject({ version: 1, contentHash: createHash('sha256').update(markdown).update(JSON.stringify(manifest)).digest('hex') });
-    const stored = database.prepare('SELECT skill_id, version, skill_markdown, manifest_json, content_hash, proposed_by_user_id FROM skill_versions WHERE id = ?').get(result?.versionId) as { skill_id: string; version: number; skill_markdown: string; manifest_json: string; content_hash: string; proposed_by_user_id: string };
-    expect(stored).toMatchObject({ version: 1, skill_markdown: markdown, manifest_json: JSON.stringify(manifest), content_hash: result?.contentHash, proposed_by_user_id: userId });
-    const audit = database.prepare("SELECT actor_type, actor_id, action, target_type, target_id, outcome, detail_json FROM audit_records WHERE action = 'skill.propose' AND target_id = ?").get(result?.versionId) as { actor_type: string; actor_id: string; action: string; target_type: string; target_id: string; outcome: string; detail_json: string };
-    expect(audit).toMatchObject({ actor_type: 'user', actor_id: userId, action: 'skill.propose', target_type: 'skill_version', target_id: result?.versionId, outcome: 'allowed' });
-    expect(JSON.parse(audit.detail_json)).toMatchObject({ skillId: result?.skillId, stableKey: 'mcp-audited', version: 1, contentHash: result?.contentHash });
-  });
-
-  it('rolls back a skill and version when its immutable audit insert fails', async () => {
-    const skillsToken = issueToken(context, projectId, userId, ['skills:propose']);
-    database.exec(`CREATE TRIGGER fail_mcp_skill_audit BEFORE INSERT ON audit_records
-      WHEN NEW.action = 'skill.propose' BEGIN SELECT RAISE(ABORT, 'audit unavailable'); END`);
-    const markdown = '---\nname: mcp-rollback\ndescription: fixture\n---\nrollback';
-    const response = await request(app, skillsToken, { jsonrpc: '2.0', id: 'skill-rollback', method: 'tools/call', params: { name: 'skill_propose', arguments: { stableKey: 'mcp-rollback', skillMarkdown: markdown } } });
-    expect((await response.json()).error.code).toBe(-32000);
-    expect(database.prepare("SELECT count(*) AS count FROM skills WHERE project_id = ? AND stable_key = 'mcp-rollback'").get(projectId)).toEqual({ count: 0 });
-    expect(database.prepare("SELECT count(*) AS count FROM skill_versions WHERE skill_markdown = ?").get(markdown)).toEqual({ count: 0 });
-  });
-
-  it('canonicalizes worktree identity and suppresses same-worktree overlap warnings', async () => {
+  it('retains terminal history without exhausting a project lifetime claim quota', async () => {
     const coordinationToken = issueToken(context, projectId, userId, ['project:read', 'coordination:write']);
-    const register = async (id: string, agentLabel: string): Promise<string> => {
-      const response = await request(app, coordinationToken, { jsonrpc: '2.0', id, method: 'tools/call', params: { name: 'coordination_session_register', arguments: { agentLabel, worktreeHash: 'repo/checkout' } } });
-      const body = await response.json() as { result: { structuredContent: { id: string } } };
-      return body.result.structuredContent.id;
-    };
-    const firstSessionId = await register('register-worktree-a', 'worktree-a');
-    const secondSessionId = await register('register-worktree-b', 'worktree-b');
-    const first = await request(app, coordinationToken, { jsonrpc: '2.0', id: 'claim-worktree-a', method: 'tools/call', params: { name: 'coordination_claim', arguments: { coordinationSessionId: firstSessionId, intent: 'first worktree claim', files: ['shared.ts'] } } });
-    const firstBody = await first.json() as { result: { structuredContent: { id: string } } };
-    const second = await request(app, coordinationToken, { jsonrpc: '2.0', id: 'claim-worktree-b', method: 'tools/call', params: { name: 'coordination_claim', arguments: { coordinationSessionId: secondSessionId, intent: 'second worktree claim', files: ['shared.ts'] } } });
-    const secondBody = await second.json() as { result: { structuredContent: { id: string; conflicts: unknown[] } } };
-    expect(secondBody.result.structuredContent.conflicts).toEqual([]);
-    const sessionRow = database.prepare('SELECT worktree_hash FROM coordination_sessions WHERE id = ?').get(firstSessionId) as { worktree_hash: string };
-    expect(sessionRow.worktree_hash).toMatch(/^wt_[A-Za-z0-9_-]{43}$/u);
-    expect(sessionRow.worktree_hash).not.toBe('repo/checkout');
-    expect(database.prepare('SELECT worktree_hash FROM coordination_claims WHERE id = ?').get(firstBody.result.structuredContent.id)).toEqual(sessionRow);
-    expect(database.prepare('SELECT worktree_hash FROM coordination_claims WHERE id = ?').get(secondBody.result.structuredContent.id)).toEqual(sessionRow);
-  });
-
-  it('caps total claims per project and per run', async () => {
-    const fixture: McpFixture = { context, token, projectId, otherProjectId, userId, database };
-    const { runId } = insertRunPair(fixture);
+    const session = await registerSession(app, coordinationToken);
     const now = context.clock.now().toISOString();
-    const coordinationSessionId = context.ids.id();
-    database.prepare('INSERT INTO coordination_sessions(id, project_id, user_id, agent_label, capability_hash, created_at, last_seen_at, expires_at) VALUES (?, ?, ?, \'claim-cap\', \'capability\', ?, ?, ?)').run(coordinationSessionId, projectId, userId, now, now, new Date(context.clock.now().getTime() + 60_000).toISOString());
-    const insert = database.prepare('INSERT INTO coordination_claims(id, project_id, coordination_session_id, run_id, intent, status, created_at, updated_at) VALUES (?, ?, ?, ?, \'existing\', \'investigating\', ?, ?)');
-    database.transaction(() => { for (let index = 0; index < 100; index += 1) insert.run(context.ids.id(), projectId, coordinationSessionId, runId, now, now); })();
-    const runToken = issueToken(context, projectId, userId, ['coordination:write'], runId);
-    const runResponse = await request(app, runToken, { jsonrpc: '2.0', id: 'run-claim-cap', method: 'tools/call', params: { name: 'coordination_claim', arguments: { intent: 'run cap' } } });
-    expect((await runResponse.json()).error.code).toBe(-32602);
-
-    database.transaction(() => { for (let index = 100; index < 1_000; index += 1) insert.run(context.ids.id(), projectId, coordinationSessionId, null, now, now); })();
-    const projectToken = issueToken(context, projectId, userId, ['coordination:write']);
-    const projectResponse = await request(app, projectToken, { jsonrpc: '2.0', id: 'project-claim-cap', method: 'tools/call', params: { name: 'coordination_claim', arguments: { intent: 'project cap' } } });
-    expect((await projectResponse.json()).error.code).toBe(-32602);
+    const insert = database.prepare("INSERT INTO coordination_claims(id, project_id, coordination_session_id, intent, status, created_at, updated_at, completed_at) VALUES (?, ?, ?, 'retained history', 'done', ?, ?, ?)");
+    database.transaction(() => { for (let index = 0; index < 1_000; index += 1) insert.run(context.ids.id(), projectId, session.id, now, now, now); })();
+    const created = await coordinationCall(app, coordinationToken, 'coordination_claim', { coordinationSessionId: session.id, intent: 'new work' }, session.capability);
+    expect(created.error).toBeUndefined();
+    expect(database.prepare('SELECT count(*) AS count FROM coordination_claims').get()).toEqual({ count: 1_001 });
   });
 
   it('limits a run-scoped token to its run and denies another run', async () => {
@@ -407,105 +409,8 @@ describe('MCP stateless Streamable HTTP boundary', () => {
     database.prepare('INSERT INTO coordination_claims(id, project_id, coordination_session_id, run_id, intent, status, created_at, updated_at) VALUES (?, ?, ?, ?, \'other run claim\', \'investigating\', ?, ?)').run(claimId, projectId, coordinationSessionId, runs.otherRunId, now, now);
     const runToken = issueToken(context, projectId, userId, ['coordination:write'], runs.runId);
     const response = await request(app, runToken, { jsonrpc: '2.0', id: 'release-other-run', method: 'tools/call', params: { name: 'coordination_release', arguments: { claimId } } });
-    expect((await response.json()).error.code).toBe(-32602);
+    expect((await response.json()).error.code).toBe(-32003);
     expect(database.prepare('SELECT status FROM coordination_claims WHERE id = ?').get(claimId)).toEqual({ status: 'investigating' });
-  });
-
-  it('does not cancel a terminal child activation', async () => {
-    const fixture: McpFixture = { context, token, projectId, otherProjectId, userId, database };
-    const { runId } = insertRunPair(fixture);
-    const now = context.clock.now().toISOString();
-    const childId = context.ids.id();
-    const activationId = context.ids.id();
-    database.prepare('INSERT INTO logical_agents(id, run_id, name, created_at) VALUES (?, ?, \'terminal child\', ?)').run(childId, runId, now);
-    database.prepare('INSERT INTO agent_activations(id, logical_agent_id, ordinal, state, ended_at, last_activity_at) VALUES (?, ?, 1, \'settled\', ?, ?)').run(activationId, childId, now, now);
-    const childToken = issueToken(context, projectId, userId, ['children:write'], runId);
-    const response = await request(app, childToken, { jsonrpc: '2.0', id: 'cancel-terminal', method: 'tools/call', params: { name: 'child_cancel', arguments: { childId, activationId } } });
-    expect((await response.json()).error.code).toBe(-32602);
-    expect(database.prepare('SELECT state FROM agent_activations WHERE id = ?').get(activationId)).toEqual({ state: 'settled' });
-  });
-
-  it('collects only messages attributed to the requested child', async () => {
-    const fixture: McpFixture = { context, token, projectId, otherProjectId, userId, database };
-    const { runId } = insertRunPair(fixture);
-    const now = context.clock.now().toISOString();
-    const sessionId = (database.prepare('SELECT session_id FROM runs WHERE id = ?').get(runId) as { session_id: string }).session_id;
-    const childId = context.ids.id();
-    const siblingId = context.ids.id();
-    database.prepare('INSERT INTO logical_agents(id, run_id, name, created_at) VALUES (?, ?, ?, ?), (?, ?, ?, ?)').run(childId, runId, 'child', now, siblingId, runId, 'sibling', now);
-    const insertMessage = database.prepare('INSERT INTO messages(id, session_id, run_id, sequence, role, logical_agent_id, body, status, created_at, completed_at) VALUES (?, ?, ?, ?, \'agent\', ?, ?, \'completed\', ?, ?)');
-    insertMessage.run(context.ids.id(), sessionId, runId, 1, childId, 'child output', now, now);
-    insertMessage.run(context.ids.id(), sessionId, runId, 2, siblingId, 'sibling secret output', now, now);
-    const childToken = issueToken(context, projectId, userId, ['children:write'], runId);
-    const response = await request(app, childToken, { jsonrpc: '2.0', id: 'collect-child', method: 'tools/call', params: { name: 'child_collect', arguments: { childId, limit: 10 } } });
-    expect(response.status).toBe(200);
-    const body = await response.json() as { result?: { structuredContent?: { messages: Array<{ body: string }> } }; error?: unknown };
-    expect(body.error).toBeUndefined();
-    expect(body.result?.structuredContent?.messages.map((message) => message.body)).toEqual(['child output']);
-  });
-
-  it('caps direct child creation by run count, parent fan-out, and lineage depth', async () => {
-    const fixture: McpFixture = { context, token, projectId, otherProjectId, userId, database };
-    const { runId, otherRunId } = insertRunPair(fixture);
-    const now = context.clock.now().toISOString();
-    const insertAgent = database.prepare('INSERT INTO logical_agents(id, run_id, name, created_at) VALUES (?, ?, ?, ?)');
-    for (let index = 0; index < 100; index += 1) insertAgent.run(context.ids.id(), runId, `agent-${index}`, now);
-    const childToken = issueToken(context, projectId, userId, ['children:write'], runId);
-    const runCapResponse = await request(app, childToken, { jsonrpc: '2.0', id: 'agent-run-cap', method: 'tools/call', params: { name: 'child_create', arguments: { name: 'overflow' } } });
-    expect((await runCapResponse.json()).error.code).toBe(-32602);
-
-    const parentId = context.ids.id();
-    insertAgent.run(parentId, otherRunId, 'parent', now);
-    const insertEdge = database.prepare('INSERT INTO agent_edges(id, run_id, parent_logical_agent_id, child_logical_agent_id, evidence, control, created_at) VALUES (?, ?, ?, ?, \'platform\', \'full\', ?)');
-    for (let index = 0; index < 8; index += 1) {
-      const childId = context.ids.id();
-      insertAgent.run(childId, otherRunId, `fanout-${index}`, now);
-      insertEdge.run(context.ids.id(), otherRunId, parentId, childId, now);
-    }
-    const otherToken = issueToken(context, projectId, userId, ['children:write'], otherRunId);
-    const fanoutResponse = await request(app, otherToken, { jsonrpc: '2.0', id: 'agent-fanout-cap', method: 'tools/call', params: { name: 'child_create', arguments: { name: 'fanout-overflow', parentAgentId: parentId } } });
-    expect((await fanoutResponse.json()).error.code).toBe(-32602);
-
-    let ancestor = parentId;
-    for (let index = 1; index < 4; index += 1) {
-      const childId = context.ids.id();
-      insertAgent.run(childId, otherRunId, `depth-${index}`, now);
-      insertEdge.run(context.ids.id(), otherRunId, ancestor, childId, now);
-      ancestor = childId;
-    }
-    const depthResponse = await request(app, otherToken, { jsonrpc: '2.0', id: 'agent-depth-cap', method: 'tools/call', params: { name: 'child_create', arguments: { name: 'depth-overflow', parentAgentId: ancestor } } });
-    expect((await depthResponse.json()).error.code).toBe(-32602);
-  });
-
-  it('honors lower limits from a run orchestration profile and fails closed on malformed config', async () => {
-    const fixture: McpFixture = { context, token, projectId, otherProjectId, userId, database };
-    const { otherRunId } = insertRunPair(fixture);
-    const now = context.clock.now().toISOString();
-    const profileId = context.ids.id();
-    const versionId = context.ids.id();
-    const executionId = context.ids.id();
-    database.prepare('INSERT INTO orchestration_profiles(id, project_id, stable_key, name, active_version, created_at) VALUES (?, ?, \'mcp-profile\', \'MCP profile\', 1, ?)').run(profileId, projectId, now);
-    database.prepare('INSERT INTO orchestration_profile_versions(id, profile_id, version, config_json, content_hash, lifecycle, created_by, created_at) VALUES (?, ?, 1, ?, \'profile-hash\', \'active\', ?, ?)').run(versionId, profileId, JSON.stringify({ limits: { maxConcurrency: 128, maxDepth: 4, maxChildrenPerParent: 0, maxWorkItems: 100 } }), userId, now);
-    database.prepare('INSERT INTO orchestration_executions(id, run_id, profile_version_id, state, max_concurrency, created_at, updated_at) VALUES (?, ?, ?, \'running\', 128, ?, ?)').run(executionId, otherRunId, versionId, now, now);
-    const parentId = context.ids.id();
-    database.prepare('INSERT INTO logical_agents(id, run_id, name, created_at) VALUES (?, ?, \'profile parent\', ?)').run(parentId, otherRunId, now);
-    const childToken = issueToken(context, projectId, userId, ['children:write'], otherRunId);
-    const childLimit = await request(app, childToken, { jsonrpc: '2.0', id: 'profile-child-limit', method: 'tools/call', params: { name: 'child_create', arguments: { parentAgentId: parentId, name: 'blocked by profile' } } });
-    expect((await childLimit.json()).error.code).toBe(-32602);
-    expect(database.prepare('SELECT count(*) AS count FROM logical_agents WHERE run_id = ?').get(otherRunId)).toEqual({ count: 1 });
-
-    database.prepare('UPDATE orchestration_profile_versions SET config_json = ? WHERE id = ?').run(JSON.stringify({ limits: { maxConcurrency: 128, maxDepth: 1, maxChildrenPerParent: 8, maxWorkItems: 100 } }), versionId);
-    const depthLimit = await request(app, childToken, { jsonrpc: '2.0', id: 'profile-depth-limit', method: 'tools/call', params: { name: 'child_create', arguments: { parentAgentId: parentId, name: 'blocked by depth' } } });
-    expect((await depthLimit.json()).error.code).toBe(-32602);
-
-    database.prepare('INSERT INTO agent_activations(id, logical_agent_id, ordinal, state, last_activity_at) VALUES (?, ?, 1, \'queued\', ?)').run(context.ids.id(), parentId, now);
-    database.prepare('UPDATE orchestration_profile_versions SET config_json = ? WHERE id = ?').run(JSON.stringify({ limits: { maxConcurrency: 1, maxDepth: 4, maxChildrenPerParent: 8, maxWorkItems: 100 } }), versionId);
-    const concurrencyLimit = await request(app, childToken, { jsonrpc: '2.0', id: 'profile-concurrency-limit', method: 'tools/call', params: { name: 'child_create', arguments: { parentAgentId: parentId, name: 'blocked by concurrency' } } });
-    expect((await concurrencyLimit.json()).error.code).toBe(-32602);
-
-    database.prepare('UPDATE orchestration_profile_versions SET config_json = ? WHERE id = ?').run('{invalid-json', versionId);
-    const malformed = await request(app, childToken, { jsonrpc: '2.0', id: 'profile-invalid', method: 'tools/call', params: { name: 'child_create', arguments: { name: 'blocked by invalid profile' } } });
-    expect((await malformed.json()).error.code).toBe(-32602);
   });
 
   it('rejects a token after its user is disabled', async () => {

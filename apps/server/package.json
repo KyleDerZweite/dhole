@@ -10,8 +10,9 @@
     "dev": "node --enable-source-maps --watch dist/index.js",
     "lint": "tsc -p tsconfig.json --noEmit",
     "start": "node --enable-source-maps dist/index.js",
+    "recover-account": "node dist/recover-account.js",
     "test": "vitest",
-    "test:run": "vitest run --passWithNoTests",
+    "test:run": "vitest run --passWithNoTests --maxWorkers=4 --testTimeout=15000",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {

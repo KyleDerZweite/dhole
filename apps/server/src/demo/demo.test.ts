@@ -1,9 +1,11 @@
 import { afterEach, describe, expect, it } from 'vitest';
+import { createApplication } from '../app.js';
 import { EventStore } from '../lib/events.js';
 import { openDatabase } from '../lib/database.js';
 import { secureIds, systemClock } from '../lib/clock.js';
 import { verifyPassword } from '../lib/security.js';
 import type { ServerContext } from '../lib/module.js';
+import { canAccessProject } from '../modules/core/projects.js';
 import { DEMO_ADMIN_EMAIL, DEMO_ADMIN_PASSWORD, DEMO_CREDENTIALS, DEMO_IDS, DEMO_MEMBER_EMAIL, DEMO_MEMBER_PASSWORD, seedDemo } from './index.js';
 
 const databases: Array<ReturnType<typeof openDatabase>> = [];
@@ -42,16 +44,18 @@ describe('offline demo seed', () => {
     expect(first.counts.repositories).toBe(1);
     expect(first.counts.runtimes).toBe(4);
     expect(first.counts.participants).toBe(2);
+    expect(canAccessProject(server, { id: DEMO_IDS.member }, DEMO_IDS.project, true)).toBe(true);
     expect(first.counts.agents).toBe(4);
     expect(first.counts.edges).toBe(3);
     expect(first.counts.approvals).toBe(1);
     expect(first.counts.conflicts).toBe(1);
     expect(first.counts.gatewayRequests).toBe(3);
-    expect(first.counts.benchmarks).toBe(2);
-    expect(first.counts.benchmarkRuns).toBe(2);
-    expect(first.counts.memoryGenerations).toBe(2);
-    expect(first.counts.memoryProposals).toBe(1);
-    expect(server.database.prepare('SELECT count(*) AS count FROM event_log WHERE project_id = ?').get(DEMO_IDS.project)).toEqual({ count: 21 });
+    expect(server.database.prepare('SELECT provider_id FROM gateway_connections WHERE id = ?').get(DEMO_IDS.gateway)).toEqual({ provider_id: DEMO_IDS.providerOpenAI });
+    expect(server.database.prepare('SELECT count(*) AS count FROM gateway_catalog_snapshots').get()).toEqual({ count: 1 });
+    expect(server.database.prepare('SELECT count(*) AS count FROM event_log WHERE project_id = ?').get(DEMO_IDS.project)).toEqual({ count: 15 });
+    for (const table of ['memory_packs', 'orchestration_profiles', 'skills', 'benchmarks']) {
+      expect(server.database.prepare(`SELECT count(*) AS count FROM ${table}`).get()).toEqual({ count: 0 });
+    }
     const approval = server.database.prepare('SELECT state, expires_at FROM approvals WHERE id = ?').get(DEMO_IDS.approval) as { state: string; expires_at: string };
     expect(approval.state).toBe('pending');
     expect(Date.parse(approval.expires_at) - Date.now()).toBeGreaterThan(23 * 60 * 60 * 1_000);
@@ -70,5 +74,24 @@ describe('offline demo seed', () => {
     server.config = { ...server.config, environment: 'production' };
     expect(() => seedDemo(server)).toThrow(/disabled in production/);
     expect(server.database.prepare('SELECT count(*) AS count FROM teams').get()).toEqual({ count: 0 });
+  });
+
+  it('serves the seeded catalog through native authentication with legacy evidence treated as unknown', async () => {
+    const server = context();
+    const { app } = createApplication({ config: server.config, database: server.database, seed: true });
+    const login = await app.request('http://127.0.0.1:4173/api/auth/login', {
+      method: 'POST', headers: { host: '127.0.0.1', 'content-type': 'application/json' },
+      body: JSON.stringify({ email: DEMO_ADMIN_EMAIL, password: DEMO_ADMIN_PASSWORD }),
+    });
+    expect(login.status).toBe(200);
+    const cookie = login.headers.getSetCookie().map((value) => value.split(';')[0]).join('; ');
+    const response = await app.request(`http://127.0.0.1:4173/api/gateway/connections/${DEMO_IDS.gateway}/catalog`, {
+      headers: { host: '127.0.0.1', cookie },
+    });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      status: 'current', sourceMatchesConnection: true,
+      models: [{ modelKey: 'gpt-4o-mini', enabled: true, available: true, measuredCapabilities: { tools: 'unknown' } }],
+    });
   });
 });

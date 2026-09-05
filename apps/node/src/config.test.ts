@@ -26,7 +26,7 @@ describe('node transport configuration', () => {
     expect(loadNodeConfig({ DHOLE_NODE_SECRETS: JSON.stringify({ 'provider-secret': 'abcd' }) }).secrets.get('provider-secret')).toBe('abcd');
   });
 
-  it('rejects node frame sizes above Fleet\'s one-megabyte cap', () => {
+  it('rejects node frame sizes above the server\'s one-megabyte cap', () => {
     expect(() => loadNodeConfig({ DHOLE_NODE_MAX_FRAME_BYTES: String(1_048_577) })).toThrow();
     expect(loadNodeConfig({ DHOLE_NODE_MAX_FRAME_BYTES: String(1_048_576) }).maxFrameBytes).toBe(1_048_576);
   });

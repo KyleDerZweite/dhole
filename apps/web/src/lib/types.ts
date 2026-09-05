@@ -6,6 +6,8 @@ export interface User {
   displayName: string;
   role: 'administrator' | 'member';
   teamId: string;
+  status: 'active' | 'pending' | 'disabled';
+  github?: { userId: number; login: string };
   createdAt?: string;
 }
 
@@ -143,24 +145,58 @@ export interface GatewayRequest extends JsonObject {
   correlationConfidence?: string | null;
 }
 
-export interface LabRun extends JsonObject {
-  id?: string;
-  benchmarkId?: string;
-  state?: string;
-  baseline?: JsonObject;
-  candidate?: JsonObject;
-  createdAt?: string;
-}
-
-export interface MemoryPack extends JsonObject {
-  id?: string;
-  name?: string;
-  stableKey?: string;
-  scope?: string;
-  activeGenerationId?: string;
-}
-
 export interface Route {
-  kind: 'dashboard' | 'project' | 'session' | 'agent' | 'gateway' | 'lab' | 'memory' | 'admin' | 'login';
+  kind: 'account' | 'connect' | 'modules' | 'dashboard' | 'projects' | 'coordination' | 'agents' | 'project' | 'session' | 'agent' | 'gateway' | 'admin' | 'login';
   id?: string;
+}
+
+export interface AuthMethods {
+  mode: string;
+  password: boolean;
+  bootstrap: boolean;
+  bootstrapTokenRequired: boolean;
+  github: boolean;
+  githubLink: boolean;
+}
+
+export interface ModuleCatalog {
+  enabledModules: string[];
+  modules: Array<{
+    id: string;
+    dependencies: string[];
+    contributions: {
+      navigation: Array<{ id: string; label: string; path: string }>;
+      webSockets: string[];
+      jobs: string[];
+    };
+  }>;
+}
+
+export interface DeviceRequest {
+  machineName: string;
+  permissions: string[];
+  expiresAt: string;
+  status: 'pending' | 'approved';
+}
+
+export interface DeviceCredential {
+  id: string;
+  machineName: string;
+  machineId: string | null;
+  permissions: string[];
+  createdAt: string;
+  expiresAt: string;
+  lastUsedAt: string | null;
+  revokedAt: string | null;
+}
+
+export interface AccountGrant { kind: 'invitation' | 'password-reset'; token: string }
+
+export interface CoordinationState {
+  project: string;
+  now: string;
+  sessions: Array<{ id: string; agent: string; active: boolean }>;
+  claims: Array<{ id: string; status: string; coordinationSessionId: string; updatedAt: string; scope: { intent: string; task?: string; files: string[]; components: string[] } }>;
+  completed: Array<{ id: string }>;
+  conflicts: Array<{ claimId: string; conflictingClaimId: string; severity: string; resolvedAt: string | null }>;
 }

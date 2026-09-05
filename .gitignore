@@ -9,5 +9,10 @@ data/
 *.db-wal
 *.log
 .env
+.env.*
+!.env.example
+secrets/
+*.pem
+*.key
 .mediation.json
 .DS_Store

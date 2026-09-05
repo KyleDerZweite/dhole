@@ -17,6 +17,7 @@ import {
 
 export const DEFAULT_SESSION_TTL_MS = 120_000;
 export const DEFAULT_CLAIM_IDLE_TTL_MS = 45 * 60_000;
+const AGENT_EVENT_CLOCK_WINDOW_MS = 5 * 60_000;
 const TERMINAL_STATUSES = ['done', 'abandoned', 'expired', 'released'] as const;
 const ACTIVE_STATUSES = ['investigating', 'in-progress', 'testing', 'blocked'] as const;
 const FINDING_KINDS = ['root-cause', 'gotcha', 'decision', 'api-change'] as const;
@@ -84,6 +85,8 @@ export interface RepoReport {
 }
 
 export interface CreateClaimInput {
+  /** Authenticated identity supplied by the server boundary. */
+  userId?: string;
   sessionId: string;
   intent: string;
   task?: string | null;
@@ -103,6 +106,7 @@ export interface CreateClaimInput {
 }
 
 export interface PatchClaimInput {
+  userId?: string;
   runId?: string | null;
   intent?: string;
   task?: string | null;
@@ -120,6 +124,7 @@ export interface PatchClaimInput {
 }
 
 export interface CompleteClaimInput {
+  userId?: string;
   runId?: string | null;
   commits?: string[];
   prs?: string[];
@@ -134,6 +139,8 @@ export interface ClaimResult {
 }
 
 export interface AgentEventInput {
+  /** Authenticated identity, never accepted from a request body. */
+  userId?: string;
   eventId: string;
   runId: string;
   agentId: string;
@@ -264,18 +271,19 @@ export class CoordinationService {
     return this.database.transaction(operation)();
   }
 
-  private appendEvent(projectId: string, eventKind: 'session.created' | 'claim.created' | 'claim.updated' | 'claim.settled' | 'conflict.detected', aggregateId: string,
-    payload: Record<string, unknown>, sessionId?: string): void {
+  private appendEvent(projectId: string, eventKind: 'session.created' | 'claim.created' | 'claim.updated' | 'claim.settled' | 'conflict.detected' | 'progress.changed', aggregateId: string,
+    payload: Record<string, unknown>, sessionId?: string, userId?: string | null): void {
     if (!this.#events) return;
     let actor: { type: 'system' } | { type: 'user'; userId: string } = { type: 'system' };
     if (sessionId) {
       const row = this.database.prepare('SELECT user_id FROM coordination_sessions WHERE id = ?').get(sessionId) as Row | undefined;
       if (row?.user_id) actor = { type: 'user', userId: String(row.user_id) };
     }
+    if (userId) actor = { type: 'user', userId };
     this.#events.append({
       projectId,
       eventKind,
-      aggregateType: eventKind === 'session.created' ? 'coordination_session' : 'coordination_claim',
+      aggregateType: eventKind === 'session.created' ? 'coordination_session' : eventKind === 'progress.changed' ? 'coordination_agent_execution' : 'coordination_claim',
       aggregateId,
       actor,
       source: { kind: 'platform', adapter: 'coordination' },
@@ -301,18 +309,24 @@ export class CoordinationService {
     if (!run) throw new CoordinationError(403, 'run_project_mismatch', 'The run is outside this project');
   }
 
-  private requireSession(projectId: string, sessionId: string, capability?: string, allowEnded = false, requireCapability = false): Row {
+  private requireSession(projectId: string, sessionId: string, capability?: string, allowEnded = false, requireCapability = false, userId?: string): Row {
     this.requireProject(projectId);
     const row = this.database.prepare('SELECT * FROM coordination_sessions WHERE project_id = ? AND id = ?').get(projectId, sessionId) as Row | undefined;
     if (!row) throw new CoordinationError(404, 'session_not_found', 'Session not found');
-    if (!allowEnded && row.ended_at) throw new CoordinationError(403, 'session_ended', 'Session has ended');
-    if (!row.ended_at && String(row.expires_at) <= this.clock.now().toISOString()) {
-      this.database.prepare('UPDATE coordination_sessions SET ended_at = expires_at WHERE id = ?').run(sessionId);
-      if (!allowEnded) throw new CoordinationError(403, 'session_expired', 'Session has expired; start a new session');
-    }
+    this.assertSessionUser(row, userId);
     if (requireCapability && capability === undefined) throw new CoordinationError(403, 'capability_required', 'Session capability required');
     if (capability !== undefined) this.assertCapability(row, capability);
+    if (!allowEnded && row.ended_at) throw new CoordinationError(403, 'session_ended', 'Session has ended');
+    if (!row.ended_at && String(row.expires_at) <= this.clock.now().toISOString()) {
+      if (!allowEnded) throw new CoordinationError(403, 'session_expired', 'Session has expired; start a new session');
+    }
     return row;
+  }
+
+  private assertSessionUser(row: Row, userId?: string): void {
+    if (userId !== undefined && row.user_id !== userId) {
+      throw new CoordinationError(403, 'session_owner_mismatch', 'Session belongs to another user');
+    }
   }
 
   /**
@@ -327,7 +341,10 @@ export class CoordinationService {
     const mismatch = this.database.prepare(`SELECT 1 FROM coordination_claims
       WHERE project_id = ? AND coordination_session_id = ? AND run_id IS NOT NULL AND run_id <> ? LIMIT 1`)
       .get(projectId, sessionId, runScope);
-    if (mismatch) throw new CoordinationError(403, 'run_scope_denied', 'The coordination session has claims outside this run');
+    const executionMismatch = this.database.prepare(`SELECT 1 FROM coordination_agent_executions
+      WHERE project_id = ? AND session_id = ? AND scope_run_id IS NOT NULL AND scope_run_id <> ? LIMIT 1`)
+      .get(projectId, sessionId, runScope);
+    if (mismatch || executionMismatch) throw new CoordinationError(403, 'run_scope_denied', 'The coordination session has work outside this run');
   }
 
   private assertCapability(row: Row, capability: string): void {
@@ -338,13 +355,13 @@ export class CoordinationService {
     if (!ok) throw new CoordinationError(403, 'capability_invalid', 'Session capability is invalid');
   }
 
-  private findSessionByCapability(projectId: string, capability: string): Row {
+  private findSessionByCapability(projectId: string, capability: string, userId?: string): Row {
     const row = this.database.prepare('SELECT * FROM coordination_sessions WHERE project_id = ? AND capability_hash = ?')
       .get(projectId, capabilityHash(capability)) as Row | undefined;
     if (!row) throw new CoordinationError(403, 'capability_invalid', 'Session capability is invalid');
+    this.assertSessionUser(row, userId);
     if (row.ended_at) throw new CoordinationError(403, 'session_ended', 'Session has ended');
     if (String(row.expires_at) <= this.clock.now().toISOString()) {
-      this.database.prepare('UPDATE coordination_sessions SET ended_at = expires_at WHERE id = ? AND ended_at IS NULL').run(row.id);
       throw new CoordinationError(403, 'session_expired', 'Session has expired; start a new session');
     }
     return row;
@@ -404,8 +421,8 @@ export class CoordinationService {
     return this.sessionView(row, capability);
   }
 
-  heartbeat(projectId: string, sessionId: string, input: { activity?: string | null; branch?: string | null; revision?: string | null; dirtyFiles?: string[]; capability?: string }, runScope?: string): CoordinationSession {
-    const row = this.requireSession(projectId, sessionId, input.capability, false, true);
+  heartbeat(projectId: string, sessionId: string, input: { activity?: string | null; branch?: string | null; revision?: string | null; dirtyFiles?: string[]; capability?: string; userId?: string }, runScope?: string): CoordinationSession {
+    const row = this.requireSession(projectId, sessionId, input.capability, false, true, input.userId);
     this.requireSessionRunScope(projectId, sessionId, runScope);
     const t = this.clock.now();
     const seen = t.toISOString();
@@ -422,24 +439,26 @@ export class CoordinationService {
             JSON.stringify(cleanFiles(input.dirtyFiles ?? previous?.dirtyFiles)), seen);
       }
     });
-    return this.sessionView({ ...row, last_seen_at: seen, expires_at: expires, ended_at: null }, input.capability);
+    return this.sessionView({ ...row, last_seen_at: seen, expires_at: expires, ended_at: null });
   }
 
-  endSession(projectId: string, sessionId: string, capability?: string, reason = 'transport ended', runScope?: string): { ok: true; session: CoordinationSession } {
-    const row = this.requireSession(projectId, sessionId, capability, true, true);
+  endSession(projectId: string, sessionId: string, capability?: string, reason = 'transport ended', runScope?: string, userId?: string): { ok: true; session: CoordinationSession } {
+    const row = this.requireSession(projectId, sessionId, capability, true, true, userId);
     this.requireSessionRunScope(projectId, sessionId, runScope);
-    if (row.ended_at) return { ok: true, session: this.sessionView(row, capability) };
-    const endedAt = this.clock.now().toISOString();
+    if (row.ended_at) return { ok: true, session: this.sessionView(row) };
+    const endedAt = new Date(Math.min(this.clock.now().getTime(), new Date(String(row.expires_at)).getTime())).toISOString();
     this.transaction(() => {
       this.database.prepare('UPDATE coordination_sessions SET ended_at = ?, expires_at = ? WHERE id = ?').run(endedAt, endedAt, sessionId);
+      const claims = this.database.prepare("SELECT id FROM coordination_claims WHERE coordination_session_id = ? AND status NOT IN ('done','abandoned','expired','released')").all(sessionId) as Row[];
+      for (const claim of claims) this.releaseBlockers(projectId, String(claim.id), endedAt);
     });
     // The reason is intentionally not persisted; it can contain paths or a prompt.
     void reason;
-    return { ok: true, session: this.sessionView({ ...row, ended_at: endedAt, expires_at: endedAt }, capability) };
+    return { ok: true, session: this.sessionView({ ...row, ended_at: endedAt, expires_at: endedAt }) };
   }
 
-  reportRepo(projectId: string, sessionId: string, input?: { branch?: string | null; revision?: string | null; dirtyFiles?: string[]; capability?: string }, runScope?: string): RepoReport | null {
-    if (input) this.requireSession(projectId, sessionId, input.capability, false, true);
+  reportRepo(projectId: string, sessionId: string, input?: { branch?: string | null; revision?: string | null; dirtyFiles?: string[]; capability?: string; userId?: string }, runScope?: string): RepoReport | null {
+    if (input) this.requireSession(projectId, sessionId, input.capability, false, true, input.userId);
     else this.requireSession(projectId, sessionId, undefined, true, false);
     this.requireSessionRunScope(projectId, sessionId, runScope);
     if (input) {
@@ -470,7 +489,10 @@ export class CoordinationService {
     const claimId = String(row.id);
     const fileRows = this.database.prepare('SELECT normalized_path FROM coordination_claim_files WHERE claim_id = ? ORDER BY normalized_path').all(claimId) as Row[];
     const componentRows = this.database.prepare('SELECT normalized_component FROM coordination_claim_components WHERE claim_id = ? ORDER BY normalized_component').all(claimId) as Row[];
-    const findingRows = this.database.prepare('SELECT kind, text, files_json, created_at FROM coordination_findings WHERE claim_id = ? ORDER BY created_at').all(claimId) as Row[];
+    const findingRows = this.database.prepare(`WITH RECURSIVE history(id) AS (
+      SELECT ? UNION SELECT c.recovered_from_claim_id FROM coordination_claims c JOIN history h ON h.id = c.id
+      WHERE c.recovered_from_claim_id IS NOT NULL
+    ) SELECT kind, text, files_json, created_at FROM coordination_findings WHERE claim_id IN (SELECT id FROM history) ORDER BY created_at`).all(claimId) as Row[];
     const settlement = this.database.prepare('SELECT commits_json, prs_json FROM coordination_claim_settlements WHERE claim_id = ?').get(claimId) as Row | undefined;
     const files = fileRows.map((file) => String(file.normalized_path));
     const components = componentRows.map((component) => String(component.normalized_component));
@@ -504,16 +526,21 @@ export class CoordinationService {
     };
     // Extended fields are useful to server callers while the shared Claim wire
     // shape stays stable. They contain only relative paths and opaque ids.
-    return Object.assign(claim, { findings, commits, prs, summary: asString(row.summary), branch: asString(row.branch), baseRevision: asString(row.base_revision) });
+    return Object.assign(claim, { findings, commits, prs, summary: asString(row.summary), branch: asString(row.branch), baseRevision: asString(row.base_revision), recoveredFromClaimId: asString(row.recovered_from_claim_id) });
   }
 
   private overlapClaims(projectId: string, runId?: string): OverlapClaim[] {
-    const claims = this.claimRows(projectId, false, runId).map((row) => {
+    // A bounded state preview must never truncate conflict detection.
+    const rows = this.database.prepare(`SELECT * FROM coordination_claims WHERE project_id = ?
+      AND status NOT IN ('done','abandoned','expired','released')${runId === undefined ? '' : ' AND run_id = ?'}`)
+      .all(projectId, ...(runId === undefined ? [] : [runId])) as Row[];
+    const claims = rows.map((row) => {
       const claim = this.claimView(row);
       const repo = this.reportRepo(projectId, String(row.coordination_session_id));
       const dirtyFiles = repo?.dirtyFiles ?? [];
       return {
         id: claim.id,
+        workItemId: claim.workItemId ?? null,
         coordinationSessionId: claim.coordinationSessionId,
         status: claim.status,
         scope: {
@@ -538,8 +565,13 @@ export class CoordinationService {
     return row?.developer_label == null ? null : String(row.developer_label);
   }
 
-  check(projectId: string, scope: WorkScope, runId?: string): ConflictWarning[] {
+  check(projectId: string, scope: WorkScope, runId?: string, capability?: string, userId?: string): ConflictWarning[] {
+    this.requireProject(projectId);
     this.requireRunProject(projectId, runId);
+    if (scope.sessionId) {
+      this.requireSession(projectId, scope.sessionId, capability, false, true, userId);
+      this.requireSessionRunScope(projectId, scope.sessionId, runId);
+    }
     this.sweep(projectId);
     const proposed: WorkScope = {
       ...scope,
@@ -606,13 +638,15 @@ export class CoordinationService {
     const scopedInput: CreateClaimInput = runId === input.runId
       ? input
       : { ...input, ...(runId === undefined ? {} : { runId }) };
-    const session = this.requireSession(projectId, scopedInput.sessionId, scopedInput.capability, false, true);
+    const session = this.requireSession(projectId, scopedInput.sessionId, scopedInput.capability, false, true, input.userId);
+    this.requireSessionRunScope(projectId, scopedInput.sessionId, runScope);
     const scope: WorkScope = {
       files: cleanFiles(scopedInput.files), components: cleanComponents(scopedInput.components), intent: scopedInput.intent,
       task: scopedInput.task, worktree: scopedInput.worktree ?? asString(session.worktree_hash), sessionId: scopedInput.sessionId,
+      workItemId: scopedInput.workItemId ?? null,
     };
     return this.transaction(() => {
-      const conflicts = this.check(projectId, scope, runScope);
+      const conflicts = this.check(projectId, scope, runScope, input.capability, input.userId);
       if ((scopedInput.enforce || scopedInput.mode === 'enforced') && conflicts.some((conflict) => hasBlockingOverlap(conflict.reasons))) {
         throw new BlockingOverlapError(conflicts.filter((conflict) => hasBlockingOverlap(conflict.reasons)));
       }
@@ -634,24 +668,23 @@ export class CoordinationService {
     return row;
   }
 
-  private authorizeClaim(projectId: string, claim: Row, capability?: string): Row {
+  private authorizeClaim(projectId: string, claim: Row, capability?: string, userId?: string): Row {
     const owner = this.database.prepare('SELECT * FROM coordination_sessions WHERE project_id = ? AND id = ?')
       .get(projectId, claim.coordination_session_id) as Row | undefined;
     if (owner && !owner.ended_at && String(owner.expires_at) > this.clock.now().toISOString()) {
+      this.assertSessionUser(owner, userId);
       if (capability !== undefined) this.assertCapability(owner, capability);
       else if (owner.capability_hash) throw new CoordinationError(403, 'capability_required', 'Session capability required');
       return owner;
     }
     if (!capability) throw new CoordinationError(403, 'capability_required', 'Session capability required to adopt a claim');
-    const caller = this.findSessionByCapability(projectId, capability);
-    if (owner && owner.developer_label !== caller.developer_label) {
-      throw new CoordinationError(403, 'claim_owner_mismatch', 'Claim belongs to another developer');
+    const caller = this.findSessionByCapability(projectId, capability, userId);
+    if (!owner?.user_id || owner.user_id !== caller.user_id) {
+      throw new CoordinationError(403, 'claim_owner_mismatch', 'Claim belongs to another user');
     }
     if (owner && (!owner.worktree_hash || !caller.worktree_hash || caller.worktree_hash !== owner.worktree_hash)) {
       throw new CoordinationError(403, 'claim_worktree_mismatch', 'Claim belongs to another worktree');
     }
-    this.database.prepare('UPDATE coordination_claims SET coordination_session_id = ?, updated_at = ? WHERE id = ?')
-      .run(caller.id, this.clock.now().toISOString(), claim.id);
     return caller;
   }
 
@@ -659,7 +692,8 @@ export class CoordinationService {
     const runId = this.scopedRunId(runScope, input.runId);
     this.requireRunProject(projectId, runId);
     const claim = this.claimRow(projectId, claimId, runScope);
-    const session = this.authorizeClaim(projectId, claim, input.capability);
+    const session = this.authorizeClaim(projectId, claim, input.capability, input.userId);
+    this.requireSessionRunScope(projectId, String(session.id), runScope);
     if (isTerminal(String(claim.status))) throw new CoordinationError(409, 'claim_settled', 'Settled claims cannot be patched');
     const current = this.claimView(this.claimRow(projectId, claimId, runScope));
     const files = input.files === undefined ? current.scope.files : cleanFiles(input.files);
@@ -674,9 +708,9 @@ export class CoordinationService {
     }
     const t = this.clock.now().toISOString();
     this.transaction(() => {
-      this.database.prepare(`UPDATE coordination_claims SET intent = ?, task = ?, worktree_hash = ?, branch = ?,
+      this.database.prepare(`UPDATE coordination_claims SET coordination_session_id = ?, intent = ?, task = ?, worktree_hash = ?, branch = ?,
         base_revision = ?, status = ?, blocked_on = ?, updated_at = ? WHERE id = ?`).run(
-        cleanText(input.intent ?? current.scope.intent, 2_000),
+        session.id, cleanText(input.intent ?? current.scope.intent, 2_000),
         input.task === undefined ? current.scope.task ?? null : cleanText(input.task, 500),
         input.worktree === undefined ? asString(claim.worktree_hash) : worktreeHash(input.worktree),
         input.branch === undefined ? (current as Claim & { branch?: string | null }).branch ?? null : cleanText(input.branch, 240),
@@ -690,7 +724,7 @@ export class CoordinationService {
       const insertComponent = this.database.prepare('INSERT INTO coordination_claim_components(claim_id, normalized_component) VALUES (?, ?)');
       for (const component of components) insertComponent.run(claimId, component);
       if (input.finding) {
-        const finding = redactText(input.finding, 2_000);
+        const finding = cleanText(input.finding, 2_000);
         this.database.prepare(`INSERT INTO coordination_findings(id, claim_id, kind, text, files_json, created_at)
           VALUES (?, ?, ?, ?, ?, ?)`).run(this.ids.id(), claimId, input.findingKind ?? null, finding,
           JSON.stringify(cleanFiles(input.findingFiles ?? files)), t);
@@ -700,48 +734,107 @@ export class CoordinationService {
     return this.claimView(this.claimRow(projectId, claimId, runScope));
   }
 
+  /** Recover idle/released work under a new id without erasing its terminal history. */
+  reviveClaim(projectId: string, claimId: string, input: PatchClaimInput, runScope?: string): ClaimResult {
+    const runId = this.scopedRunId(runScope, input.runId);
+    this.requireRunProject(projectId, runId);
+    const prior = this.claimRow(projectId, claimId, runScope);
+    const session = this.authorizeClaim(projectId, prior, input.capability, input.userId);
+    this.requireSessionRunScope(projectId, String(session.id), runScope);
+    if (!['expired', 'released'].includes(String(prior.status))) {
+      throw new CoordinationError(409, 'claim_not_recoverable', 'Only expired or released claims can be revived');
+    }
+    return this.transaction(() => {
+      const replacement = this.database.prepare('SELECT * FROM coordination_claims WHERE recovered_from_claim_id = ?').get(claimId) as Row | undefined;
+      if (replacement) {
+        this.authorizeClaim(projectId, replacement, input.capability, input.userId);
+        return { claim: this.claimView(replacement), conflicts: [] };
+      }
+      const current = this.claimView(prior);
+      const result = this.createClaim(projectId, {
+        sessionId: String(session.id), intent: current.scope.intent, task: current.scope.task ?? null,
+        files: current.scope.files, components: current.scope.components,
+        worktree: asString(prior.worktree_hash), branch: asString(prior.branch), baseRevision: asString(prior.base_revision),
+        ...input, runId: asString(prior.run_id), workItemId: asString(prior.work_item_id),
+      }, runScope);
+      this.database.prepare('UPDATE coordination_claims SET recovered_from_claim_id = ? WHERE id = ?').run(claimId, result.claim.id);
+      if (input.finding) this.updateClaim(projectId, result.claim.id, input, runScope);
+      this.appendEvent(projectId, 'claim.updated', result.claim.id, { recoveredFromClaimId: claimId }, String(session.id));
+      return { ...result, claim: this.claimView(this.claimRow(projectId, result.claim.id, runScope)) };
+    });
+  }
+
   completeClaim(projectId: string, claimId: string, input: CompleteClaimInput, runScope?: string): Claim {
     const runId = this.scopedRunId(runScope, input.runId);
     this.requireRunProject(projectId, runId);
     const claim = this.claimRow(projectId, claimId, runScope);
-    const session = this.authorizeClaim(projectId, claim, input.capability);
+    const session = this.authorizeClaim(projectId, claim, input.capability, input.userId);
+    this.requireSessionRunScope(projectId, String(session.id), runScope);
     const status = input.status ?? 'done';
-    if (isTerminal(String(claim.status))) {
-      if (String(claim.status) === status) return this.claimView(claim);
-      throw new CoordinationError(409, 'claim_settled', 'Settled claims cannot be completed again');
+    if (claim.status === 'expired' || claim.status === 'released') {
+      return this.transaction(() => {
+        const recovered = this.reviveClaim(projectId, claimId, {
+          ...(input.capability === undefined ? {} : { capability: input.capability }),
+          ...(input.userId === undefined ? {} : { userId: input.userId }),
+        }, runScope);
+        return this.completeClaim(projectId, recovered.claim.id, input, runScope);
+      });
+    }
+    const settled = isTerminal(String(claim.status));
+    if (settled && claim.status !== status) {
+      throw new CoordinationError(409, 'claim_settled', 'Settled claims cannot change their outcome');
     }
     const commits = [...new Set((input.commits ?? []).map((value) => cleanText(value, 240)).filter((value): value is string => value != null))];
     const prs = [...new Set((input.prs ?? []).map((value) => cleanText(value, 500)).filter((value): value is string => value != null))];
     const t = this.clock.now().toISOString();
     this.transaction(() => {
       const existing = this.database.prepare('SELECT commits_json, prs_json FROM coordination_claim_settlements WHERE claim_id = ?').get(claimId) as Row | undefined;
-      let priorCommits: string[] = [];
-      let priorPrs: string[] = [];
-      if (existing) {
-        try { priorCommits = JSON.parse(String(existing.commits_json)) as string[]; } catch { /* empty */ }
-        try { priorPrs = JSON.parse(String(existing.prs_json)) as string[]; } catch { /* empty */ }
-      }
+      const priorCommits = existing ? JSON.parse(String(existing.commits_json)) as string[] : [];
+      const priorPrs = existing ? JSON.parse(String(existing.prs_json)) as string[] : [];
+      const mergedCommits = [...new Set([...priorCommits, ...commits])];
+      const mergedPrs = [...new Set([...priorPrs, ...prs])];
+      if (settled && mergedCommits.length === priorCommits.length && mergedPrs.length === priorPrs.length) return;
       this.database.prepare(`INSERT INTO coordination_claim_settlements(claim_id, commits_json, prs_json) VALUES (?, ?, ?)
         ON CONFLICT(claim_id) DO UPDATE SET commits_json=excluded.commits_json, prs_json=excluded.prs_json`)
-        .run(claimId, JSON.stringify([...new Set([...priorCommits, ...commits])]), JSON.stringify([...new Set([...priorPrs, ...prs])]));
-      this.database.prepare('UPDATE coordination_claims SET status = ?, summary = ?, blocked_on = NULL, updated_at = ?, completed_at = ? WHERE id = ?')
-        .run(status, cleanText(input.summary, 2_000), t, t, claimId);
-      this.appendEvent(projectId, 'claim.settled', claimId, { status, commitCount: commits.length, prCount: prs.length }, String(session.id));
-      this.database.prepare(`UPDATE coordination_conflicts SET resolved_at = ? WHERE (claim_id = ? OR conflicting_claim_id = ?)
-        AND resolved_at IS NULL`).run(t, claimId, claimId);
+        .run(claimId, JSON.stringify(mergedCommits), JSON.stringify(mergedPrs));
+      if (!settled) {
+        this.database.prepare('UPDATE coordination_claims SET coordination_session_id = ?, status = ?, summary = ?, blocked_on = NULL, updated_at = ?, completed_at = ? WHERE id = ?')
+          .run(session.id, status, cleanText(input.summary, 2_000), t, t, claimId);
+        this.resolveClaim(projectId, claimId, t);
+      }
+      this.appendEvent(projectId, settled ? 'claim.updated' : 'claim.settled', claimId,
+        { status, commitCount: mergedCommits.length, prCount: mergedPrs.length, ...(settled ? { evidenceAdded: true } : {}) }, String(session.id));
     });
     return this.claimView(this.claimRow(projectId, claimId, runScope));
   }
 
-  releaseClaim(projectId: string, claimId: string, capability?: string, runScope?: string): Claim {
+  private resolveClaim(projectId: string, claimId: string, at: string): void {
+    this.database.prepare(`UPDATE coordination_conflicts SET resolved_at = ? WHERE (claim_id = ? OR conflicting_claim_id = ?)
+      AND resolved_at IS NULL`).run(at, claimId, claimId);
+    this.releaseBlockers(projectId, claimId, at);
+  }
+
+  private releaseBlockers(projectId: string, claimId: string, at: string): void {
+    const blocked = this.database.prepare(`SELECT id, coordination_session_id FROM coordination_claims WHERE project_id = ? AND blocked_on = ?
+      AND status NOT IN ('done','abandoned','expired','released')`).all(projectId, claimId) as Row[];
+    for (const row of blocked) {
+      this.database.prepare(`UPDATE coordination_claims SET blocked_on = NULL,
+        status = CASE WHEN status = 'blocked' THEN 'in-progress' ELSE status END, updated_at = ? WHERE id = ?`).run(at, row.id);
+      this.appendEvent(projectId, 'claim.updated', String(row.id), { blockerResolved: claimId }, String(row.coordination_session_id));
+    }
+  }
+
+  releaseClaim(projectId: string, claimId: string, capability?: string, runScope?: string, userId?: string): Claim {
     this.requireRunProject(projectId, runScope);
     const claim = this.claimRow(projectId, claimId, runScope);
-    const session = this.authorizeClaim(projectId, claim, capability);
-    if (isTerminal(String(claim.status)) && claim.status !== 'released') return this.claimView(claim);
+    const session = this.authorizeClaim(projectId, claim, capability, userId);
+    this.requireSessionRunScope(projectId, String(session.id), runScope);
+    if (isTerminal(String(claim.status))) return this.claimView(claim);
     const t = this.clock.now().toISOString();
     this.transaction(() => {
-      this.database.prepare('UPDATE coordination_claims SET status = \'released\', updated_at = ?, completed_at = COALESCE(completed_at, ?) WHERE id = ?').run(t, t, claimId);
-      this.database.prepare('UPDATE coordination_conflicts SET resolved_at = ? WHERE (claim_id = ? OR conflicting_claim_id = ?) AND resolved_at IS NULL').run(t, claimId, claimId);
+      this.database.prepare("UPDATE coordination_claims SET coordination_session_id = ?, status = 'released', updated_at = ?, completed_at = ? WHERE id = ?")
+        .run(session.id, t, t, claimId);
+      this.resolveClaim(projectId, claimId, t);
       this.appendEvent(projectId, 'claim.settled', claimId, { status: 'released' }, String(session.id));
     });
     return this.claimView(this.claimRow(projectId, claimId, runScope));
@@ -763,82 +856,88 @@ export class CoordinationService {
   }
 
   recordAgentEvent(projectId: string, input: AgentEventInput, runScope?: string): { idempotent: boolean; execution: AgentExecutionView } {
-    const runId = this.scopedRunId(runScope, input.runId);
-    this.requireRunProject(projectId, runId);
+    this.requireProject(projectId);
+    this.requireRunProject(projectId, runScope);
     const session = input.sessionId
-      ? this.requireSession(projectId, input.sessionId, input.capability, false, true)
-      : input.capability ? this.findSessionByCapability(projectId, input.capability) : undefined;
+      ? this.requireSession(projectId, input.sessionId, input.capability, false, true, input.userId)
+      : input.capability ? this.findSessionByCapability(projectId, input.capability, input.userId) : undefined;
     const sessionId = session ? String(session.id) : null;
+    if (sessionId) this.requireSessionRunScope(projectId, sessionId, runScope);
+    const userId = input.userId ?? asString(session?.user_id);
+    const occurredMs = new Date(input.occurredAt).getTime();
+    if (!Number.isFinite(occurredMs)) throw new CoordinationError(422, 'invalid_event_time', 'occurredAt must be a valid timestamp');
+    const now = this.clock.now();
+    const receivedAt = now.toISOString();
+    const occurredAt = new Date(occurredMs > now.getTime() + AGENT_EVENT_CLOCK_WINDOW_MS ? now.getTime() : occurredMs).toISOString();
     const payload = {
       eventId: input.eventId, runId: input.runId, agentId: input.agentId, parentAgentId: input.parentAgentId ?? null,
       harness: cleanText(input.harness, 64) ?? 'unknown', name: cleanText(input.name, 80), role: cleanText(input.role, 64),
-      task: cleanText(input.task, 280), state: input.state, stateReason: cleanText(input.stateReason, 280), occurredAt: String(input.occurredAt),
+      task: cleanText(input.task, 280), state: input.state, stateReason: cleanText(input.stateReason, 280),
+      occurredAt: new Date(occurredMs).toISOString(), sessionId, runScope: runScope ?? null,
     };
     const payloadHash = digest(stableJson(payload));
-    const priorEvent = this.database.prepare('SELECT * FROM coordination_agent_events WHERE project_id = ? AND event_id = ?').get(projectId, input.eventId) as Row | undefined;
-    if (priorEvent) {
-      if (String(priorEvent.payload_hash) !== payloadHash) throw new CoordinationError(409, 'event_replay_mismatch', 'Agent event id was already used with different content');
-      const row = this.database.prepare('SELECT * FROM coordination_agent_executions WHERE id = ?').get(priorEvent.execution_id) as Row;
-      return { idempotent: true, execution: this.agentExecutionView(row) };
-    }
-    const runHash = digest(input.runId);
+    // Native identifiers are scoped to their authenticated reporter. Labels never identify an owner.
+    const eventId = digest(stableJson([userId, input.eventId]));
+    const runHash = digest(stableJson([userId, runScope ?? null, input.runId]));
     const agentHash = digest(input.agentId);
     const parentHash = input.parentAgentId ? digest(input.parentAgentId) : null;
-    const t = this.clock.now().toISOString();
-    const existing = this.database.prepare('SELECT * FROM coordination_agent_executions WHERE project_id = ? AND run_hash = ? AND agent_hash = ?')
-      .get(projectId, runHash, agentHash) as Row | undefined;
-    const executionId = existing ? String(existing.id) : this.ids.id();
-    if (existing && ['completed', 'failed', 'cancelled'].includes(String(existing.state))) {
-      this.transaction(() => {
-        this.database.prepare(`INSERT INTO coordination_agent_events(project_id, event_id, execution_id, payload_hash, occurred_at, received_at)
-          VALUES (?, ?, ?, ?, ?, ?)`).run(projectId, input.eventId, executionId, payloadHash, String(input.occurredAt), t);
-      });
-      return { idempotent: false, execution: this.agentExecutionView(existing) };
-    }
-    this.transaction(() => {
-      if (!existing) {
-        const parent = parentHash ? this.database.prepare('SELECT id FROM coordination_agent_executions WHERE project_id = ? AND run_hash = ? AND agent_hash = ?')
-          .get(projectId, runHash, parentHash) as Row | undefined : undefined;
-        this.database.prepare(`INSERT INTO coordination_agent_executions
-          (id, project_id, session_id, run_hash, agent_hash, parent_hash, parent_execution_id, harness, name, role, task,
-           state, state_reason, provenance, started_at, updated_at, ended_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'harness-reported', ?, ?, ?)`).run(
-          executionId, projectId, sessionId, runHash, agentHash, parentHash, parent?.id ?? null, payload.harness,
-          payload.name, payload.role, payload.task, payload.state, payload.stateReason, t, t,
-          ['completed', 'failed', 'cancelled'].includes(input.state) ? t : null,
-        );
-      } else {
-        this.database.prepare(`UPDATE coordination_agent_executions SET session_id = COALESCE(?, session_id), harness = ?,
-          name = COALESCE(?, name), role = COALESCE(?, role), task = COALESCE(?, task), state = ?, state_reason = ?,
-          updated_at = ?, ended_at = CASE WHEN ? IN ('completed','failed','cancelled') THEN ? ELSE ended_at END WHERE id = ?`)
-          .run(sessionId, payload.harness, payload.name, payload.role, payload.task, payload.state, payload.stateReason, t,
-            input.state, t, executionId);
+    return this.transaction(() => {
+      const priorEvent = this.database.prepare('SELECT * FROM coordination_agent_events WHERE project_id = ? AND event_id = ?')
+        .get(projectId, eventId) as Row | undefined;
+      if (priorEvent) {
+        if (String(priorEvent.payload_hash) !== payloadHash) throw new CoordinationError(409, 'event_replay_mismatch', 'Agent event id was already used with different content');
+        const row = this.database.prepare('SELECT * FROM coordination_agent_executions WHERE id = ?').get(priorEvent.execution_id) as Row;
+        return { idempotent: true, execution: this.agentExecutionView(row) };
       }
-      if (parentHash) {
-        const parent = this.database.prepare('SELECT id FROM coordination_agent_executions WHERE project_id = ? AND run_hash = ? AND agent_hash = ?')
-          .get(projectId, runHash, parentHash) as Row | undefined;
-        this.database.prepare('UPDATE coordination_agent_executions SET parent_hash = ?, parent_execution_id = COALESCE(parent_execution_id, ?) WHERE id = ?')
-          .run(parentHash, parent?.id ?? null, executionId);
+      const existing = this.database.prepare('SELECT * FROM coordination_agent_executions WHERE project_id = ? AND run_hash = ? AND agent_hash = ?')
+        .get(projectId, runHash, agentHash) as Row | undefined;
+      const stale = occurredMs < now.getTime() - AGENT_EVENT_CLOCK_WINDOW_MS;
+      if (!existing && stale) throw new CoordinationError(409, 'event_too_old', 'An old event cannot create an execution');
+      const executionId = existing ? String(existing.id) : this.ids.id();
+      const newer = !existing || (!stale && occurredAt > String(existing.occurred_at ?? existing.updated_at));
+      if (newer) {
+        const parent = parentHash ? this.database.prepare('SELECT id FROM coordination_agent_executions WHERE project_id = ? AND run_hash = ? AND agent_hash = ? AND id <> ?')
+          .get(projectId, runHash, parentHash, executionId) as Row | undefined : undefined;
+        const terminal = ['completed', 'failed', 'cancelled'].includes(input.state);
+        if (!existing) {
+          this.database.prepare(`INSERT INTO coordination_agent_executions
+            (id, project_id, user_id, scope_run_id, session_id, run_hash, agent_hash, parent_hash, parent_execution_id, harness, name, role, task,
+             state, state_reason, provenance, started_at, updated_at, occurred_at, ended_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'harness-reported', ?, ?, ?, ?)`).run(
+            executionId, projectId, userId, runScope ?? null, sessionId, runHash, agentHash, parentHash, parent?.id ?? null, payload.harness,
+            payload.name, payload.role, payload.task, payload.state, payload.stateReason, occurredAt, receivedAt, occurredAt, terminal ? occurredAt : null,
+          );
+        } else {
+          this.database.prepare(`UPDATE coordination_agent_executions SET session_id = COALESCE(?, session_id), harness = ?,
+            name = COALESCE(?, name), role = COALESCE(?, role), task = COALESCE(?, task), state = ?, state_reason = ?,
+            updated_at = ?, occurred_at = ?, ended_at = ?, parent_hash = COALESCE(?, parent_hash),
+            parent_execution_id = CASE WHEN ? IS NULL THEN parent_execution_id ELSE ? END WHERE id = ?`)
+            .run(sessionId, payload.harness, payload.name, payload.role, payload.task, payload.state, payload.stateReason,
+              receivedAt, occurredAt, terminal ? occurredAt : null, parentHash, parentHash, parent?.id ?? null, executionId);
+        }
+        this.database.prepare(`UPDATE coordination_agent_executions SET parent_execution_id = ?
+          WHERE project_id = ? AND run_hash = ? AND parent_hash = ? AND parent_execution_id IS NULL AND id <> ?`)
+          .run(executionId, projectId, runHash, agentHash, executionId);
+        this.appendEvent(projectId, 'progress.changed', executionId, { state: input.state, occurredAt, resumed: Boolean(existing?.ended_at && !terminal) }, sessionId ?? undefined, userId);
       }
-      this.database.prepare(`UPDATE coordination_agent_executions SET parent_execution_id = ?
-        WHERE project_id = ? AND run_hash = ? AND parent_hash = ? AND parent_execution_id IS NULL AND id <> ?`)
-        .run(executionId, projectId, runHash, agentHash, executionId);
       this.database.prepare(`INSERT INTO coordination_agent_events(project_id, event_id, execution_id, payload_hash, occurred_at, received_at)
-        VALUES (?, ?, ?, ?, ?, ?)`).run(projectId, input.eventId, executionId, payloadHash, String(input.occurredAt), t);
+        VALUES (?, ?, ?, ?, ?, ?)`).run(projectId, eventId, executionId, payloadHash, payload.occurredAt, receivedAt);
+      const row = this.database.prepare('SELECT * FROM coordination_agent_executions WHERE id = ?').get(executionId) as Row;
+      return { idempotent: false, execution: this.agentExecutionView(row) };
     });
-    const row = this.database.prepare('SELECT * FROM coordination_agent_executions WHERE id = ?').get(executionId) as Row;
-    return { idempotent: false, execution: this.agentExecutionView(row) };
   }
 
   private agentExecutionView(row: Row): AgentExecutionView {
     const state = String(row.state) as AgentExecutionView['state'];
+    const session = row.session_id ? this.database.prepare('SELECT ended_at, expires_at FROM coordination_sessions WHERE id = ?').get(row.session_id) as Row | undefined : undefined;
+    const liveSession = session && !session.ended_at && String(session.expires_at) > nowIso(this.clock);
     return {
       id: String(row.id), projectId: String(row.project_id), name: asString(row.name), role: asString(row.role),
       task: cleanText(asString(row.task), 280), state, stateReason: cleanText(asString(row.state_reason), 280),
       harness: redactText(String(row.harness), 64), provenance: String(row.provenance) as AgentExecutionView['provenance'],
-      sessionId: asString(row.session_id), parentAvailable: row.parent_execution_id != null,
+      sessionId: liveSession ? asString(row.session_id) : null, parentAvailable: row.parent_execution_id != null,
       startedAt: String(row.started_at), updatedAt: String(row.updated_at), endedAt: asString(row.ended_at),
-      stale: false,
+      stale: !['completed', 'failed', 'cancelled'].includes(state) && !liveSession && this.clock.now().getTime() - new Date(String(row.updated_at)).getTime() > this.sessionTtlMs,
     };
   }
 
@@ -859,6 +958,7 @@ export class CoordinationService {
   }
 
   getState(projectId: string, runId?: string): CoordinationState {
+    this.requireProject(projectId);
     this.requireRunProject(projectId, runId);
     this.sweep(projectId);
     const claimRows = this.claimRows(projectId, false, runId);
@@ -882,7 +982,7 @@ export class CoordinationService {
       .map(([file, item]) => ({ file, agents: [...item.agents], updatedAt: item.updatedAt }));
     const agents = (runId === undefined
       ? this.database.prepare(`SELECT * FROM coordination_agent_executions WHERE project_id = ? ORDER BY updated_at DESC LIMIT ?`).all(projectId, this.maxStateItems)
-      : this.database.prepare(`SELECT * FROM coordination_agent_executions WHERE project_id = ? AND run_hash = ? ORDER BY updated_at DESC LIMIT ?`).all(projectId, digest(runId), this.maxStateItems)
+      : this.database.prepare(`SELECT * FROM coordination_agent_executions WHERE project_id = ? AND scope_run_id = ? ORDER BY updated_at DESC LIMIT ?`).all(projectId, runId, this.maxStateItems)
     ) as Row[];
     return { project: projectId, now: nowIso(this.clock), sessions, claims, completed, conflicts: this.conflicts(projectId, runId), recentFiles, agents: agents.map((row) => this.agentExecutionView(row)) };
   }
@@ -897,20 +997,27 @@ export class CoordinationService {
     const sessionCutoff = now.toISOString();
     const projectClause = projectId ? ' AND project_id = ?' : '';
     const args = projectId ? [projectId] : [];
-    this.database.prepare(`UPDATE coordination_sessions SET ended_at = COALESCE(ended_at, expires_at)
-      WHERE ended_at IS NULL AND expires_at <= ?${projectClause}`).run(sessionCutoff, ...args);
+    const sessions = this.database.prepare(`SELECT id, project_id, expires_at FROM coordination_sessions
+      WHERE ended_at IS NULL AND expires_at <= ?${projectClause}`).all(sessionCutoff, ...args) as Row[];
     const claimRows = this.database.prepare(`SELECT id, project_id FROM coordination_claims
       WHERE status NOT IN (${TERMINAL_STATUSES.map(() => '?').join(',')}) AND updated_at < ?${projectClause}`)
       .all(...TERMINAL_STATUSES, cutoff, ...args) as Row[];
-    for (const row of claimRows) {
-      const t = now.toISOString();
-      this.database.prepare("UPDATE coordination_claims SET status = 'expired', updated_at = ?, completed_at = ? WHERE id = ? AND status NOT IN ('done','abandoned','expired','released')")
-        .run(t, t, row.id);
-      this.database.prepare('UPDATE coordination_conflicts SET resolved_at = ? WHERE (claim_id = ? OR conflicting_claim_id = ?) AND resolved_at IS NULL').run(t, row.id, row.id);
-    }
-    // Keep bounded event history. The execution row remains, while old raw event
-    // ids/hashes can be evicted because retries after this point are new events.
-    this.database.prepare(`DELETE FROM coordination_agent_events WHERE received_at < datetime(?, '-7 days')`).run(now.toISOString());
+    this.transaction(() => {
+      for (const session of sessions) {
+        this.database.prepare('UPDATE coordination_sessions SET ended_at = expires_at WHERE id = ? AND ended_at IS NULL').run(session.id);
+        const claims = this.database.prepare("SELECT id FROM coordination_claims WHERE coordination_session_id = ? AND status NOT IN ('done','abandoned','expired','released')").all(session.id) as Row[];
+        for (const claim of claims) this.releaseBlockers(String(session.project_id), String(claim.id), now.toISOString());
+      }
+      for (const row of claimRows) {
+        const t = now.toISOString();
+        this.database.prepare("UPDATE coordination_claims SET status = 'expired', updated_at = ?, completed_at = ? WHERE id = ? AND status NOT IN ('done','abandoned','expired','released')")
+          .run(t, t, row.id);
+        this.resolveClaim(String(row.project_id), String(row.id), t);
+        this.appendEvent(String(row.project_id), 'claim.settled', String(row.id), { status: 'expired' });
+      }
+    });
+    // Retry records expire; immutable lifecycle transitions remain in the event log.
+    this.database.prepare('DELETE FROM coordination_agent_events WHERE received_at < ?').run(new Date(now.getTime() - 7 * 24 * 60 * 60_000).toISOString());
   }
 }
 

@@ -1,13 +1,12 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { secureIds, systemClock } from '../apps/server/dist/lib/clock.js';
 import { openDatabase } from '../apps/server/dist/lib/database.js';
 import { EventStore } from '../apps/server/dist/lib/events.js';
-import { FleetService, handleNodeConnection } from '../apps/server/dist/modules/fleet/index.js';
-import { OrchestrationService } from '../apps/server/dist/modules/orchestration/service.js';
+import { MachineService, handleNodeConnection } from '../apps/server/dist/modules/core/machines/index.js';
 import { loadNodeConfig } from '../apps/node/dist/config.js';
 import { FakeNode } from '../apps/node/dist/fake.js';
 import { FakeRuntimeAdapter } from '../apps/node/dist/runtimes/fake.js';
@@ -43,64 +42,80 @@ try {
     INSERT INTO team_members(team_id, user_id, role, created_at) VALUES ('team', 'user', 'administrator', '${at}');
     INSERT INTO projects(id, team_id, name, created_by, created_at, updated_at) VALUES ('project', 'team', 'Project', 'user', '${at}', '${at}');
     INSERT INTO repositories(id, project_id, label, default_branch, created_by, created_at, updated_at) VALUES ('repository', 'project', 'Repository', 'main', 'user', '${at}', '${at}');
-    INSERT INTO sessions(id, project_id, title, state, created_by, created_at, updated_at) VALUES ('session', 'project', 'Runtime path', 'idle', 'user', '${at}', '${at}');
-    INSERT INTO runs(id, session_id, root_objective, state, created_by, created_at, updated_at) VALUES ('run', 'session', 'Complete the runtime path fixture', 'queued', 'user', '${at}', '${at}');
   `);
   const events = new EventStore(database, systemClock, secureIds);
-  const context = { database, clock: systemClock, ids: secureIds, events, config: {} };
-  const fleet = new FleetService(database, systemClock, secureIds);
-  const token = fleet.issueEnrollmentToken({ teamId: 'team', label: 'runtime-node', createdBy: 'user' });
-  const device = fleet.consumeEnrollmentToken(token.token);
-  fleet.addRepositoryAllowlist(device.machineId, 'repository', repository);
+  const machines = new MachineService(database, systemClock, secureIds, {}, events);
+  const token = machines.issueEnrollmentToken({ teamId: 'team', label: 'runtime-node', createdBy: 'user' });
+  const device = machines.consumeEnrollmentToken(token.token);
+  machines.addRepositoryAllowlist(device.machineId, 'repository', repository);
   const fakeRuntime = new FakeRuntimeAdapter();
-  node = new FakeNode({
-    config: loadNodeConfig({
-      DHOLE_NODE_MACHINE_ID: device.machineId,
-      DHOLE_NODE_CREDENTIAL: device.credential,
-      DHOLE_NODE_STATE_DIR: state,
-      DHOLE_NODE_REPOSITORIES: JSON.stringify({ repository }),
-    }),
-    executor: { discoverRuntimes: () => [fakeRuntime.descriptor()] },
+  const config = loadNodeConfig({
+    DHOLE_NODE_MACHINE_ID: device.machineId,
+    DHOLE_NODE_CREDENTIAL: device.credential,
+    DHOLE_NODE_STATE_DIR: state,
+    DHOLE_NODE_REPOSITORIES: JSON.stringify({ repository }),
   });
+  const createNode = () => new FakeNode({ config, executor: { discoverRuntimes: () => [fakeRuntime.descriptor()] } });
+  node = createNode();
   node.start();
-  detach = handleNodeConnection(node.serverSocket, fleet, { machineId: device.machineId, credential: device.credential });
-  await waitFor(() => fleet.getMachine(device.machineId)?.status === 'connected', 'Fake node did not connect');
+  detach = handleNodeConnection(node.serverSocket, machines, { machineId: device.machineId, credential: device.credential });
+  await waitFor(() => machines.getMachine(device.machineId)?.status === 'connected', 'Fake node did not connect');
   await waitFor(() => database.prepare("SELECT count(*) AS count FROM runtime_registrations WHERE machine_id = ? AND kind = 'fake' AND available = 1").get(device.machineId).count === 1, 'Fake runtime was not discovered');
 
-  const orchestration = new OrchestrationService(context, { fleet });
-  const profile = orchestration.createProfile({
-    projectId: 'project',
-    stableKey: 'runtime-path',
-    name: 'Runtime path',
-    createdBy: 'user',
-    config: {
-      fake: false,
-      initialChildren: 1,
-      eligibleMachineIds: [device.machineId],
-      workspacePolicy: 'isolated',
-      limits: { maxConcurrency: 1, maxRetries: 0 },
-    },
+  const command = (kind, fields) => ({
+    commandId: `command-${kind}`, operationKey: `operation-${kind}`, kind,
+    issuedAt: at, expiresAt: new Date(Date.now() + 60_000).toISOString(), ...fields,
   });
-  const started = orchestration.startExecution({ projectId: 'project', runId: 'run', profileVersionId: profile.version.id });
-  try {
+  const execute = async (command) => {
+    machines.enqueueCommand({ machineId: device.machineId, projectId: 'project', command });
     await waitFor(() => {
-      orchestration.tick('project');
-      return orchestration.getExecution('project', started.id).state === 'settled';
-    }, 'Orchestration did not settle through the node runtime');
-  } catch (error) {
-    const snapshot = orchestration.getExecution('project', started.id);
-    const commandStates = fleet.listCommands(device.machineId).map((command) => ({ kind: command.kind, state: command.state, error: command.error }));
-    throw new Error(`${error instanceof Error ? error.message : String(error)}: ${JSON.stringify({ snapshot, commandStates })}`);
-  }
+      const current = machines.getCommand(device.machineId, command.operationKey);
+      assert.ok(!['failed', 'uncertain', 'expired'].includes(current?.state), `${command.kind} failed: ${current?.error ?? current?.state}`);
+      return current?.state === 'completed';
+    }, `${command.kind} did not complete`);
+    return machines.getCommand(device.machineId, command.operationKey);
+  };
+  const worktreePath = '.dhole/worktrees/runtime-path';
+  const worktree = command('create_worktree', {
+    repositoryId: 'repository', branch: 'codex/runtime-smoke', baseRevision: 'main', relativeTarget: worktreePath,
+  });
+  await execute(worktree);
+  assert.equal(readFileSync(join(repository, worktreePath, 'README.md'), 'utf8'), 'runtime path fixture\n');
+  assert.equal(execFileSync('git', ['-C', join(repository, worktreePath), 'branch', '--show-current'], { encoding: 'utf8' }).trim(), 'codex/runtime-smoke');
 
-  const completed = orchestration.getExecution('project', started.id);
-  const child = completed.workItems.find((item) => item.parentWorkItemId);
-  assert.equal(child?.result?.text, 'Fake response: Complete the runtime path fixture\n\nWorker role: worker-1');
-  const commands = fleet.listCommands(device.machineId);
-  assert.deepEqual(commands.map((command) => command.kind), ['create_worktree', 'create_runtime_session', 'send_message']);
-  assert.deepEqual(commands.map((command) => command.state), ['completed', 'completed', 'completed']);
-  assert.equal(database.prepare('SELECT state FROM worktrees').get().state, 'settled');
-  process.stdout.write('runtime path smoke: worktree -> fake adapter -> objective -> settled\n');
+  const created = await execute(command('create_runtime_session', {
+    repositoryId: 'repository', runtimeId: fakeRuntime.descriptor().id,
+    runtimeSessionKey: 'runtime-path', cwd: worktreePath,
+  }));
+  assert.ok(created.result.runtimeSessionId, 'Runtime session did not return its native ID');
+  const message = command('send_message', { runtimeSessionId: created.result.runtimeSessionId, message: 'Complete the runtime path fixture' });
+  const completed = await execute(message);
+  assert.equal(completed.result.text, 'Fake response: Complete the runtime path fixture');
+  assert.ok(completed.result.events.some((event) => event.type === 'message.completed' && event.text === completed.result.text));
+  assert.deepEqual(machines.listCommands(device.machineId).map(({ kind, state }) => [kind, state]), [
+    ['create_worktree', 'completed'], ['create_runtime_session', 'completed'], ['send_message', 'completed'],
+  ]);
+  assert.deepEqual(machines.enqueueCommand({ machineId: device.machineId, projectId: 'project', command: message }), completed,
+    'A server retry must return the original completed command');
+  assert.throws(() => machines.enqueueCommand({ machineId: device.machineId, projectId: 'project', command: { ...message, message: 'Changed retry' } }),
+    { code: 'operation_key_conflict' });
+
+  const originalJournal = node.client.journal.list();
+  detach();
+  node.stop();
+  node = createNode();
+  node.start();
+  detach = handleNodeConnection(node.serverSocket, machines, { machineId: device.machineId, credential: device.credential });
+  await waitFor(() => machines.getMachine(device.machineId)?.status === 'connected', 'Restarted node did not connect');
+  const replayed = [];
+  node.serverSocket.on('message', (frame) => { replayed.push(JSON.parse(String(frame))); });
+  for (const retry of [worktree, message]) node.serverSocket.send(JSON.stringify({ type: 'command', protocol: 'dhole.node.v1', command: retry }));
+  await waitFor(() => replayed.filter((frame) => frame.type === 'command_status' && frame.state === 'completed').length === 2,
+    'Restarted node did not replay its completed journal entries');
+  assert.equal(replayed.filter((frame) => frame.type === 'runtime_event').length, 0, 'Duplicate delivery executed the runtime again');
+  assert.deepEqual(node.client.journal.list(), originalJournal, 'Duplicate delivery rewrote the durable operation journal');
+  assert.equal(machines.listCommands(device.machineId).length, 3, 'Duplicate delivery created extra commands');
+  process.stdout.write('runtime path smoke: Core worktree -> fake runtime -> message -> durable restart replay\n');
 } finally {
   detach?.();
   node?.stop();

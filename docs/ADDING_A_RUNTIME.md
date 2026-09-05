@@ -100,10 +100,9 @@ server validates descriptors and upserts them at
 not eligible for placement.
 
 Session steering checks the stored descriptor's `activeTurnSteering` value in
-addition to authorization, a running turn, and the steering lease. Orchestration
-profiles likewise use explicit runtime kinds and required capabilities. Keep
-runtime, provider, model, executor, skill, memory, and orchestration profile
-identities separate.
+addition to authorization, a running turn, and the steering lease. Core owns
+the runtime registry and session execution path. Keep runtime, provider, model,
+machine, executor, session, and static agent Skill identities separate.
 
 ## Security and boundaries
 

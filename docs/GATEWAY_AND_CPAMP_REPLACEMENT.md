@@ -1,253 +1,276 @@
-# Gateway and CPAMP replacement
+# Gateway and CPA administration
 
-## Boundary and responsibility
+CPA remains the inference service and account authority. Native runtimes and
+clients call CPA through their configured provider path. Dhole's optional
+`gateway` module stores sanitized observations, explicit model policy,
+request history, and administration audit records. The browser calls Dhole
+only. There is no inference forwarding, browser management passthrough,
+generic upstream RPC, shell endpoint, or Docker socket control.
 
-CLIProxyAPI remains the provider proxy. Dhole does not replace its
-OpenAI/Gemini/Claude-compatible request path, route provider calls through the
-browser, or embed the CLIProxyAPI/CPA Manager Plus applications. Dhole's
-`gateway` module replaces CPAMP's primary dashboard and history views: the
-central server makes bounded management reads from a configured proxy, stores a
-normalized/redacted history in SQLite, and serves the Gateway dashboard to
-authorized team members.
+Select `DHOLE_MODULES=gateway` to use Gateway with Core and Access. The full
+application can include it alongside the other modules. Gateway is not a
+requirement for native accounts, machine authorization, or Coordination.
 
-The browser communicates only with Dhole. Gateway management calls originate
-from the Dhole server. There is no browser proxy, `/api-call` passthrough,
-generic management RPC, or shell endpoint. The implementation and this guide
-were verified with the Gateway module, migration, fixture routes, and tests.
-No live CLIProxyAPI, CPAMP, provider, or Dhole instance was contacted,
-restarted, reconfigured, or otherwise changed while preparing this document.
+## Connections and credentials
 
-## Configure a connection
+An administrator creates a connection with
+`POST /api/gateway/connections`. The body contains `name`, `baseUrl`,
+`managementSecret`, optional `catalogSecret`, `enabled`, and `retentionDays`.
+The catalog credential is a CPA inference/catalog credential, separate from
+its management credential. A consumer token for Dhole's catalog projection is
+a third, narrower credential.
 
-Gateway hosts are operator-controlled by `DHOLE_GATEWAY_ALLOWED_HOSTS`, a
-comma-separated exact hostname/host allowlist (default:
-`127.0.0.1,localhost`). A connection is created by an administrator with:
+`DHOLE_GATEWAY_ALLOWED_HOSTS` controls exact allowed hostnames or hosts with
+ports. The production example starts with no allowed destinations. URLs must
+be HTTP or HTTPS, with no userinfo, query, or fragment. The server validates
+the stored destination before requests, denies redirects, bounds the complete
+response body to 512 KiB, and applies a whole-request timeout. Management
+credentials use encrypted AES-GCM envelopes with external versioned keys.
+Public records show only configured/not-configured flags.
 
-```http
-POST /api/gateway/connections
-Content-Type: application/json
-Cookie: dhole_session=...; dhole_csrf=...
-X-CSRF-Token: ...
+Every connection has an existing Runtime provider identity. Gateway updates
+that identity's endpoint and enablement; the operator does not create a
+second Provider record just to use Gateway. Discovery uses the existing model
+policy rows rather than maintaining a second enabled-model list.
 
-{
-  "name": "local CLIProxy",
-  "baseUrl": "http://127.0.0.1:8787",
-  "managementSecret": "proxy-management-bearer",
-  "enabled": true,
-  "retentionDays": 30
-}
-```
-
-The Zod boundary requires a 1–120 character name, a 1–2,048 character URL,
-and a 1–16,384 character management secret. `enabled` defaults to `true`;
-`retentionDays` defaults to 30 and is bounded to 1–3,650. `baseUrl` must be
-`http` or `https`, must not contain URL credentials, a query, or a fragment,
-and its hostname (or host including port) must exactly match the allowlist.
-Trailing slashes are normalized. Duplicate names in a team return `409`.
-
-The secret is encrypted before persistence with the shared security envelope:
-AES-256-GCM, a random nonce, external versioned 32-byte keys from
-`DHOLE_MASTER_KEYS`, the current `DHOLE_MASTER_KEY_ID`, and record-bound
-associated data `gateway:<connectionId>:management`. SQLite stores only the
-encrypted provider-secret envelope and its key id. Production refuses to
-start without a matching current master key. The secret is never returned by
-the connection list, placed in an event, logged, or sent to the browser. It is
-used only as the server-side `Authorization: Bearer` header on a management
-request.
-
-There is currently no connection update/delete route. To change a secret or
-URL, an administrator must use a planned management workflow; do not edit the
-database by hand in production.
-
-## Exact connection and synchronization routes
-
-All routes below are served by the Dhole origin and are team-authorized. A
-human administrator is required for configuration and ingestion; members can
-read and refresh data.
-
-| Method | Path | Access and behavior |
+| Method | Path under `/api/gateway` | Behavior |
 | --- | --- | --- |
-| `POST` | `/api/gateway/connections` | Administrator; validates URL/secret and creates the encrypted connection. |
-| `GET` | `/api/gateway/connections` | Team member; lists name, base URL, enabled/status, timestamps, error summary, and retention setting (never the secret). |
-| `POST` | `/api/gateway/connections/:id/health` | Team member; server performs `GET <baseUrl>/v0/management/config` with the decrypted bearer, JSON accept header, a bounded timeout (default 5 seconds, capped at 60 seconds), and redirect following disabled. |
-| `POST` | `/api/gateway/connections/:id/sync` | Team member; health-checks `v0/management/config`, then returns a zero-record sync unless queue import is explicitly enabled. Current CLIProxyAPI has no non-destructive aggregate usage export; normal traffic arrives via import/push. Add `?includeUsageQueue=true` only when an operator explicitly accepts queue consumption. |
-| `POST` | `/api/gateway/connections/:id/ingest` | Administrator; imports a JSON/JSONL/array/object fixture or historical export without making an upstream call. |
+| `GET`, `POST` | `/connections` | List safe metadata or create a connection |
+| `PATCH` | `/connections/:id` | Edit name, endpoint, enabled state, or retention with `expectedRevision` |
+| `POST` | `/connections/:id/secrets` | Replace management and/or catalog credential with `expectedRevision` |
+| `POST` | `/connections/:id/archive` | Disable and archive while retaining history |
+| `DELETE` | `/connections/:id` | Mark deleted, remove stored credentials, retain history |
+| `GET` | `/connections/:id/revisions` | Read immutable sanitized connection revisions |
+| `POST` | `/connections/:id/rollback` | Restore nonsecret metadata from `targetRevision`, subject to current revision |
+| `POST` | `/connections/:id/health` | Bounded management health check returning safe status |
+| `POST` | `/connections/:id/sync` | Health synchronization; ordinary use imports no usage records |
 
-Health marks a connection `healthy` on a 2xx response, `degraded` on a
-non-2xx response, and `unavailable` on a transport, timeout, URL, or secret
-failure. `sync` marks failures unavailable and records only a bounded error
-summary.
+Changes reject stale Dhole revisions. Connection metadata rollback does not
+restore old credentials, undelete a connection, reverse an upstream account
+change, or reactivate a key revoked by CPA. Active endpoint, credential, and enablement changes check the candidate
+management endpoint before activation. Catalog credential changes and endpoint
+changes with a catalog credential also check the catalog response. The server
+rechecks the revision after network I/O. Disabled edits wait for validation
+on enablement. These bounded checks establish endpoint acceptance, not live
+model execution.
 
-`includeUsageQueue=true` performs a second `GET` on
-`/v0/management/usage-queue?count=1000`. Some CLIProxyAPI versions consume or
-clear that queue as it is read. The default is `false`; no implicit queue read
-exists. Redirect responses from any management request are denied (`redirect:
-manual`) rather than followed to another host.
-This is the only intentionally destructive Gateway action in the MVP and is
-opt-in per request.
+The legacy queue-import path is an explicit administrator operation:
+`POST /connections/:id/sync?includeUsageQueue=true&acceptDataLoss=true`.
+It reads CPA's destructive usage queue. CPA can remove records before Dhole
+commits them, so a timeout, crash, or competing consumer can permanently lose
+records. The two flags acknowledge that loss; they do not provide a cursor,
+acknowledgment protocol, or delivery guarantee. No automatic queue polling
+runs. Prefer a retained-file import or producer push when preserving coverage
+matters.
 
-## Request history, filters, and capacity
+## Model catalog
 
-`GET /api/gateway/requests` returns `{items,total,offset,limit,nextOffset}`
-ordered by occurrence time descending. Query parameters are:
+The catalog parser accepts bounded OpenAI `data[]` and CPA Codex-style
+`models[]` envelopes. It validates at most 2,048 complete entries, rejects
+malformed or duplicate IDs, strips unsupported fields, and preserves declared
+reasoning order. Generic input is not silently truncated at 100 models.
 
-```text
-connectionId=<id>
-provider=<exact provider>
-model=<exact served model>
-authIndex=<proxy account/auth index>
-failed=true|false
-statusCode=<integer>
-occurredFrom=<ISO timestamp>
-occurredTo=<ISO timestamp>
-correlationConfidence=exact|high|medium|low|none
-limit=<1..500>       (default 50)
-offset=<0 or greater> (default 0)
-```
+Successful refreshes create immutable snapshots with source connection and
+provider, endpoint shape, client version when supplied, connection revision,
+observation time, content hash, and deterministic added/removed/changed IDs.
+Canonical reordering does not create a model change. Failed refreshes retain
+the last valid snapshot and expose the failed attempt. One hour without a
+successful observation marks it stale.
 
-The route enforces team ownership of a selected connection. It does not expose
-an account-id filter yet; use `authIndex`, provider, model, or connection
-filters. Invalid status-code integers return `422`.
+New models default disabled. Refresh preserves explicit enabled policy and
+submitted capability evidence. Removal leaves history but removes the ID from
+the effective selection; a returning ID keeps its prior explicit policy.
+Changing the source revision makes the old observation stale and excludes it
+from the effective catalog until a successful refresh.
 
-`GET /api/gateway/accounts?connectionId=<id>` returns observed provider account
-rows: opaque account id, auth index, provider, label, status, redacted quota,
-and cooldown timestamp. `GET /api/gateway/summary?connectionId=<id>` returns
-totals (requests, failures, token classes, estimated cost, average duration),
-provider/model groups, accounts, and capacity counts. Capacity considers
-`healthy`, `available`, `ready`, and `ok` account statuses available;
-`cooldownUntil` in the future counts as cooling down; `failed`, `error`, and
-`unavailable` count as failed.
-
-The dashboard's compact capacity card and its progressive Gateway page are
-views over these same routes. CPAMP is not needed at runtime.
-
-## Fixture endpoint and offline import
-
-For local development and demo mode only, the module exposes a deterministic
-fake CLIProxy-compatible endpoint. It returns `404` in production:
-
-| Method | Path | Result |
+| Method | Path under `/api/gateway` | Behavior |
 | --- | --- | --- |
-| `GET` | `/api/gateway/fixture` | `{protocol:"cliproxy.fixture",schemaVersion:1,health,records}` with redacted sample records. |
-| `GET` | `/api/gateway/fixture/v0/management/config` | `{usageStatisticsEnabled:true,fixture:true}`. |
-| `GET` | `/api/gateway/fixture/v0/management/usage-queue` | Redacted fixture records (the fake queue endpoint ignores the optional `count=1000` query). |
+| `GET` | `/connections/:id/catalog` | Snapshot, diff, freshness, declarations, policy, and evidence |
+| `POST` | `/connections/:id/catalog/refresh` | Refresh with optional `clientVersion` |
+| `PATCH` | `/connections/:id/catalog/models/:modelId` | Set `{enabled: boolean}` explicitly |
+| `GET`, `POST` | `/connections/:id/catalog/tokens` | List metadata or issue a scoped token for `generic`, `opencode`, or `codex` |
+| `DELETE` | `/connections/:id/catalog/tokens/:tokenId` | Revoke a projection token |
+| `GET` | `/catalog/v1/:connectionId/:client` | Pull-only versioned effective catalog with dedicated bearer token |
 
-Two records exercise a successful request and a rate-limit failure, token
-usage, account index, duration, and redaction. A normal `sync` against the
-fixture checks config but imports zero records because the current proxy has no
-non-destructive aggregate endpoint. To import fixture data, fetch
-`/api/gateway/fixture` and send its body to the administrator-only
-`POST /api/gateway/connections/:id/ingest`, or explicitly request queue import
-with `POST .../sync?includeUsageQueue=true`. No fixture value is treated as a
-live provider credential.
+Tokens are issued once, hashed at rest, connection/client scoped, and
+revocable. Requested lifetime is 1 to 30 days. An agent-issued token also
+records its parent API/device authority and expires no later than either
+parent, so its actual lifetime may be much shorter. Use the returned expiry.
+Parent revocation or scope change permanently revokes descendants. Current
+native project access and administrator authority are checked on use.
+Browser-issued tokens retain user authority and are permanently revoked by
+password reset, account disablement, or administrator demotion.
 
-`parseCliProxyRecords` accepts a JSON string (single object, array, or a JSONL
-stream), an array, or an object whose `records`, `requests`, `usage`, `items`,
-or `data` property contains records. Invalid JSONL identifies the line and
-returns `422`.
+Migration `015_gateway_catalog_authority.sql` revokes all older catalog tokens
+because their issuer provenance was not recorded. Reissue them after upgrade;
+copying an old private file cannot restore that authority.
 
-## Normalization, redaction, and idempotency
+The projection authenticates before conditional handling and uses private caching with an ETag over the full representation,
+including policy and freshness. A stale last-known catalog is labeled stale;
+it is not a live availability guarantee. Disabled sources have no effective
+models. Provider, management, and node credentials never enter projections.
 
-The normalizer accepts common CLIProxyAPI spellings for request id, timestamp,
-provider, served/requested model, status, endpoint, failure, duration/TTFT,
-token usage, account/auth index, project/session references, service tier,
-context size, trace reference, and estimated cost. Every stored request has
-`schemaVersion: 1` and a canonical SHA-256 `eventHash`.
+Declared tool/image/reasoning metadata is an upstream statement. The Runtime
+probe API stores administrator-submitted evidence with `verified: false`; it
+does not perform a live measurement. Legacy boolean capability records are
+shown as `unknown` so they do not masquerade as verified outcomes or break a
+catalog read. The catalog's compatibility flags mean
+that a projection can represent the observed metadata, not that an installed
+client or model has passed an execution test.
 
-Before hashing or persistence, request bodies, response bodies, prompts,
-messages, completions, usage/account credential objects, and obvious sensitive
-metadata are removed or recursively redacted. Sensitive keys include
-authorization, cookie, token, secret, password, API key, bearer, credential,
-body, prompt, completion, and content; common key/value forms are masked in
-strings. Arrays and nested objects are bounded, and free text is length
-limited. Account quota and status messages receive the same redaction.
+The optional [OpenCode startup plugin](../clients/opencode/README.md) passed
+the actual OpenCode 1.18.27 startup fixture in isolated configuration, data,
+and cache directories. It fetches through the client's config hook, replaces
+only a dedicated provider's in-memory model list, and keeps CPA inference and
+native credentials unchanged. It does not rewrite saved client configuration
+or select a default model. Scoped stale responses retain current policy with
+a warning; revoked tokens, failed reads, malformed data, or valid empty
+catalogs clear that dedicated selection. The private settings file identifies
+the provider, so its saved model map should remain empty if that file cannot
+be read. Other providers remain available.
 
-`gateway_requests` is unique on `(connection_id,event_hash)`. Re-importing the
-same normalized record reports a duplicate and does not append another
-progress event. A newly correlated request appends a redacted Dhole
-`progress.changed` event with provider/model/failure/token/cost summary; raw
-request bodies never enter the event log.
+Codex native discovery depends on its installed version and authentication
+configuration. The inspected app-server supports `model/list`, but an ordinary
+custom provider with an environment API key does not necessarily use the same
+refresh path as the Codex backend or command authentication. The generic and
+Codex projection shapes do not establish installed-client integration. See
+[Issue #2 review](reviews/issue-2.md), [MVP status](MVP_STATUS.md), and
+[Roadmap](../ROADMAP.md).
 
-## Correlation confidence
+## Request history and retention
 
-Gateway correlation is evidence-ranked and explicit in every request view:
+`POST /connections/:id/ingest` accepts retained JSON or JSONL without making
+an upstream call. The normalizer keeps bounded scalar usage, latency, status,
+model/provider, account references, and correlation evidence. It removes
+prompts, messages, bodies, credentials, and unsafe metadata, including
+secret-bearing object keys. Permanent receipt hashes prevent duplicate
+imports even after detailed request rows are pruned.
 
-| Confidence | Evidence and reason |
+The retained history is the coverage Dhole has received. It is not a promise
+of complete CPA traffic. `GET /connections/:id/collection` reports collection
+mode, last stored time, lifetime accepted count, retained range/count, and
+retention settings. No background upstream collector runs.
+
+| Method | Path under `/api/gateway` | Behavior |
+| --- | --- | --- |
+| `GET` | `/requests` | Paginated normalized records and filters |
+| `GET` | `/summary` | Observed request, token, estimated-cost, failure, and account summaries |
+| `GET` | `/usage` | UTC hour/day buckets grouped by none, provider, model, or auth index |
+| `GET` | `/requests/export` | Bounded JSON/JSONL pages with team/filter-bound cursors |
+| `GET` | `/accounts` | Sanitized observed account health, quota, and cooldown fields |
+| `GET` | `/connections/:id/collection` | Explicit import/push coverage and retention metadata |
+| `POST` | `/connections/:id/prune` | Bounded retention prune, including `dryRun` |
+| `GET`, `POST` | `/prices` | Effective-dated manual price overrides |
+
+Request filters include connection, provider, model, auth index, failed state,
+status code, occurrence range, and correlation confidence. Lists allow at most
+500 rows; usage queries at most 1,000 groups. Export pages contain at most 500
+rows and 2 MiB, with stable receipt ordering that excludes later inserts.
+Concurrent pruning can remove detail rows before a later export page reads
+them. Export is not a backup of the database or immutable history.
+
+The Gateway lifecycle starts a retention cycle after startup and then hourly.
+It processes bounded batches across connections, including disabled/archived
+connections, without upstream requests. It deletes request details only.
+Receipt hashes, catalog snapshots, events, and audits remain. Disabling the
+Gateway module stops its retention hook too.
+
+Correlation labels are evidence-ranked: an accepted session ID is `exact`,
+a runtime turn match is `high`, project plus nearby session time is `medium`,
+a project reference alone is `low`, and absent evidence is `none`. A heuristic
+match never becomes exact through presentation.
+
+Price overrides use integer micro-USD per million tokens, effective dates,
+model patterns, optional service tier, and context thresholds. Explicit zero
+is a rate. Missing cost remains unknown. Usage responses report unpriced
+requests separately and totals are estimates, not invoices. Provider quota
+and estimated spend are different observations.
+
+## Accounts, settings, and provider consent
+
+Account refresh reads permitted status fields from CPA's auth-file list.
+Dhole does not download or return credential files. The supported mutation is
+an explicit disabled/enabled change for a file-backed account, with current
+connection revision and expected account state. Missing quota windows, reset
+times, or cooldown evidence remain unknown.
+
+Typed configuration editing supports only `request-retry`,
+`max-retry-credentials`, `max-retry-interval`, and `routing/strategy`.
+`GET /connections/:id/config`, `POST .../config/preview`, and
+`POST .../config/apply` return a sanitized diff and record immutable history.
+The request includes current connection and config revisions. CPA has no
+atomic compare-and-swap contract for these writes, so conflict detection is
+best effort across management clients. Dhole does not expose raw YAML or
+claim that a local revision prevents every external race.
+
+Supported provider-consent flows are Codex, Anthropic/Claude, and Antigravity:
+
+1. Start through `POST /connections/:id/oauth` with provider and current revision.
+2. Open the validated provider authorization URL and complete its consent.
+3. Copy the resulting localhost callback URL, even if the local browser page cannot connect, and submit it through `POST /connections/:id/oauth/:flowId/callback`.
+4. Poll `GET /connections/:id/oauth/:flowId` for completion, or `DELETE` that path to cancel.
+
+Flows are bound to the authenticated administrator, team, connection revision,
+and a five-minute expiry. Dhole parses the callback without fetching it and
+forwards its transient code to CPA. A submitted callback is not yet completed
+consent. CPA retains provider credentials. Dhole starts no callback listener
+and copies no provider credential into the browser, command history, or
+client configuration.
+
+## Typed agent administration
+
+Pair with `connect --gateway` and have an administrator approve the requested
+Gateway read and management scopes. Use `dhole-node gateway --project ID
+--action JSON` or the local bridge's `gateway_manage` tool. The helper pins the
+native project used to derive team-level Gateway authority, and requests only
+the single required scope for each operation.
+It keeps machine and project credentials private and requires no Coordination
+session.
+
+`GatewayActionSchema` in `apps/node/src/gateway-client.ts` defines these 25
+operations:
+
+| Area | Action names |
 | --- | --- |
-| `exact` | A supplied `sessionId` matches a Dhole session (`native session id`). |
-| `high` | A supplied request id matches `session_turns.runtime_turn_id` (`runtime turn id`). |
-| `medium` | A supplied project id is valid and a session was updated within approximately five minutes of the request (`project and near-time match`). |
-| `low` | A valid project reference exists but no nearby session matched (`project reference only`). |
-| `none` | No trusted Dhole session or project reference was present. |
+| Connections | `connections.list`, `connections.create`, `connections.update`, `connections.rotate`, `health`, `sync` |
+| Catalog | `catalog.read`, `catalog.refresh`, `models.policy`, `tokens.list`, `tokens.issue`, `tokens.revoke` |
+| Accounts | `accounts.list`, `accounts.refresh`, `accounts.status` |
+| Settings | `config.read`, `config.preview`, `config.apply` |
+| Observations | `collection`, `usage`, `requests` |
+| Provider consent | `oauth.start`, `oauth.status`, `oauth.callback`, `oauth.cancel` |
 
-The server never upgrades a low/medium/none match to exact by guesswork.
-Filters can select the confidence label, and the UI shows it next to each
-request. A `traceReference` is retained as a redacted opaque field but is not
-itself correlation proof.
+Creation and rotation take an absolute `secretFile` reference to an owned
+private regular JSON file containing `managementSecret` and/or `catalogSecret`.
+Creation requires the management secret. Callback submission similarly reads
+`redirectFile` containing `redirectUrl`. These files are bounded to 64 KiB;
+on Unix they must have no group/other permissions and cannot be symlinks.
+Secrets never belong in action JSON or model arguments.
 
-## Pricing and cost semantics
+`oauth.start` writes the authorization URL to a private local file and returns
+`authorizationFile` metadata. `tokens.issue` writes the issued catalog token
+privately and returns `credentialFile` metadata. For `client: "opencode"`, that
+file is already the plugin's strict settings file, including its selected
+provider, connection, endpoint, and token. Set `DHOLE_OPENCODE_CATALOG_CONFIG`
+to its returned path. The default dedicated provider is `dhole-cpa`;
+`openCodeProvider` can choose another `dhole-` provider.
 
-Price overrides are administrator-managed through:
+The action union is narrower than the HTTP administration API. It includes no
+archive/delete/rollback, history export, ingestion, queue consumption, price
+changes, or prune action. Its `sync` performs the ordinary nonconsumptive
+health path. It cannot select server modules, administer human accounts,
+enroll nodes, configure unrelated runtime providers, or send an arbitrary
+HTTP request. Use the owning browser/API workflow for other supported
+operations. [Client setup](../clients/README.md) has the command examples.
 
-```http
-POST /api/gateway/prices
-Content-Type: application/json
+## Verification boundary
 
-{
-  "connectionId": "CONNECTION_ID",
-  "modelPattern": "gpt-4o*",
-  "effectiveFrom": "2026-08-30T00:00:00.000Z",
-  "promptMicrousdPerMillion": 5000000,
-  "completionMicrousdPerMillion": 15000000,
-  "cacheReadMicrousdPerMillion": 0,
-  "cacheCreateMicrousdPerMillion": 0,
-  "contextThresholdTokens": 0,
-  "serviceTier": "standard"
-}
-```
+Catalog, management, request import/export, retention, and authorization tests
+use local fixtures. The OpenCode test executes only `models --verbose` against
+a loopback catalog with isolated state and no inference request. The inspected upstream contract is CPA v7.2.151 at commit
+`5208aec703b5ce7e3445f6e9d91cc13b3e78003a`; this is evidence for fixture design,
+not a live compatibility certificate for an installed CPA instance.
 
-`connectionId` is required in practice. `modelPattern` is a case-insensitive
-exact pattern with `*` wildcard. Rates are integer micro-USD per million
-tokens; explicit zero is a real rate, not a missing value. `effectiveFrom`
-must be an ISO timestamp with offset. `serviceTier` is an optional exact
-match. `contextThresholdTokens` is a strict threshold: an override applies
-only when `contextTokens > threshold` (equal does not match). List overrides
-with `GET /api/gateway/prices?connectionId=<id>`.
-
-For a matching override, cost is rounded micro-USD:
-
-```text
-(input * prompt + output * completion
- + cached * cacheRead + cacheCreation * cacheCreate) / 1,000,000
-```
-
-The selector prefers an exact (non-wildcard) model, then the latest effective
-timestamp, then the highest applicable context threshold. Null rate fields
-fall back to zero. If there is no override/default rate at all, an upstream
-`estimated_cost_microusd` is preserved; if neither exists the stored cost is
-`null`. Dashboard totals sum these stored estimates and do not claim a billing
-invoice.
-
-## What this replaces and what it does not
-
-The MVP replaces the CPAMP dashboard's central operational views with Dhole
-views for connections, health, requests, usage, model/provider groups,
-failures, account health, quota/cooldown, capacity, correlation, and manual
-pricing. It intentionally does not mutate provider accounts or proxy traffic.
-
-Deferred until a separately reviewed management workflow (and tracked in
-`ROADMAP.md`):
-
-- Full CPAMP/CLIProxy OAuth credential onboarding and browser consent flows.
-- Destructive credential or account deletion, revocation, and rotation.
-- Complex provider-account setup and provider-side account mutation.
-- Connection edit/delete UI and automatic secret/key rotation tooling.
-- Automatic retention pruning (the configured `retentionDays` value is stored
-  and displayed, but no cleanup job is wired in this MVP).
-- Live provider conformance tests or imports that consume paid model quota.
-
-Safe health refresh, usage synchronization, fixture ingestion, redacted history,
-and price overrides are the supported management surface. Existing CLIProxyAPI
-and CPAMP deployments remain untouched during development and cutover; point
-Dhole at an allowlisted endpoint and verify with the fixture before enabling a
-live read.
+Gateway fixtures are unavailable in production. Preparation does not contact
+or change a live CPA, provider, CPAMP, or Dhole deployment. The complete
+replacement scope and deliberate gaps are recorded in
+[MVP status](MVP_STATUS.md) and [Roadmap](../ROADMAP.md).

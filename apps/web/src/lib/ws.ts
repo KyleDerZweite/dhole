@@ -29,8 +29,13 @@ export class AppSocket {
     this.#closed = true;
     if (this.#timer !== undefined) window.clearTimeout(this.#timer);
     this.#timer = undefined;
-    this.#socket?.close();
+    const socket = this.#socket;
     this.#socket = undefined;
+    this.#attempt = 0;
+    this.#sessionId = '';
+    this.#after = 0;
+    socket?.close();
+    this.#onStatus('offline');
   }
 
   private open(): void {
@@ -40,11 +45,13 @@ export class AppSocket {
     const socket = new WebSocket(`${protocol}//${location.host}/ws/app`);
     this.#socket = socket;
     socket.addEventListener('open', () => {
+      if (this.#closed || this.#socket !== socket) return;
       this.#attempt = 0;
       this.#onStatus('connected');
       socket.send(JSON.stringify({ type: 'subscribe', sessionId: this.#sessionId, afterSequence: this.#after }));
     });
     socket.addEventListener('message', (message) => {
+      if (this.#closed || this.#socket !== socket) return;
       try {
         const value: unknown = JSON.parse(String(message.data));
         if (!value || typeof value !== 'object') return;
@@ -56,12 +63,13 @@ export class AppSocket {
       } catch { /* malformed frames are ignored; HTTP snapshot remains authoritative */ }
     });
     const retry = (): void => {
-      if (this.#closed) return;
+      if (this.#closed || this.#socket !== socket) return;
+      this.#socket = undefined;
       this.#onStatus('reconnecting');
       this.#attempt += 1;
       this.#timer = window.setTimeout(() => this.open(), Math.min(15_000, 500 * 2 ** Math.min(this.#attempt, 5)));
     };
     socket.addEventListener('close', retry);
-    socket.addEventListener('error', () => { if (socket.readyState === WebSocket.OPEN) socket.close(); });
+    socket.addEventListener('error', () => { if (this.#socket === socket) socket.close(); });
   }
 }

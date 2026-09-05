@@ -4,7 +4,12 @@ import { getConnInfo } from '@hono/node-server/conninfo';
 import { z } from 'zod';
 import { hashPassword, hashToken, redactText, tokenMatches, verifyPassword } from '../../lib/security.js';
 import { HttpError, parseJson } from '../../lib/http.js';
+import { getSessionAuthentication, loadSessionUser as loadSessionUserByHash, notifySessionAuthorizationChanged } from '../../lib/session-auth.js';
 import type { AppEnvironment, AuthenticatedUser, DholeApp, DholeModule, ServerContext } from '../../lib/module.js';
+import { revokeUserDeviceAuthorizations } from '../access/index.js';
+import { GithubOAuth, linkGithubIdentity } from './github.js';
+import { accessibleProjectIds, canAccessProject, registerProjectMembershipRoutes } from './projects.js';
+import { registerAccountGrantRoutes, revokeUserAccountGrants } from './account-grants.js';
 
 /**
  * Browser-facing authentication and project primitives.  The module deliberately
@@ -14,22 +19,46 @@ import type { AppEnvironment, AuthenticatedUser, DholeApp, DholeModule, ServerCo
 
 const SESSION_COOKIE = 'dhole_session';
 const CSRF_COOKIE = 'dhole_csrf';
+const OAUTH_COOKIE = 'dhole_github_state';
 const SESSION_DAYS = 7;
 const serverByContext = new WeakMap<object, ServerContext>();
+const PUBLIC_AUTH_MUTATIONS = new Set(['/api/auth/login', '/api/auth/bootstrap', '/api/auth/invitation/accept', '/api/auth/password/reset']);
+const DUMMY_PASSWORD_HASH = 'scrypt$32768$8$3$c29tZS1wdWJsaWMtc2FsdA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';
+let activePasswordChecks = 0;
+
+async function checkPassword(password: string, encoded: string): Promise<boolean> {
+  if (activePasswordChecks >= 4) throw new HttpError(429, 'rate_limited', 'Too many authentication attempts');
+  activePasswordChecks += 1;
+  try { return await verifyPassword(password, encoded); }
+  finally { activePasswordChecks -= 1; }
+}
 
 const LoginSchema = z.object({
   email: z.string().trim().email().max(320),
   password: z.string().min(1).max(1_024),
 });
 
+export const NativePasswordSchema = z.string().max(1_024).refine((value) => [...value].length >= 15, 'Password must contain at least 15 characters');
+
 const UserSchema = z.object({
   email: z.string().trim().email().max(320),
   displayName: z.string().trim().min(1).max(160),
-  password: z.string().min(12).max(1_024),
+  password: NativePasswordSchema,
   role: z.enum(['administrator', 'member']).default('member'),
 });
 
 const BootstrapSchema = UserSchema.extend({ teamName: z.string().trim().min(1).max(160).default('Dhole') });
+const CurrentPasswordSchema = z.object({ currentPassword: z.string().min(1).max(1_024) });
+const PasswordChangeSchema = CurrentPasswordSchema.extend({ newPassword: UserSchema.shape.password });
+const UserUpdateSchema = z.object({
+  status: z.enum(['active', 'disabled']).optional(),
+  role: z.enum(['administrator', 'member']).optional(),
+}).refine((value) => value.status !== undefined || value.role !== undefined, 'An account status or role is required');
+const GithubCallbackSchema = z.object({
+  state: z.string().min(32).max(128),
+  code: z.string().min(1).max(1_024).optional(),
+  error: z.string().max(256).optional(),
+});
 
 const ProjectCreateSchema = z.object({
   name: z.string().trim().min(1).max(160),
@@ -71,6 +100,8 @@ export interface PublicUser {
   role: AuthenticatedUser['role'];
   teamId: string;
   createdAt: string;
+  status: 'active' | 'pending' | 'disabled';
+  github?: { userId: number; login: string } | undefined;
 }
 
 export interface PublicProject {
@@ -197,7 +228,7 @@ function cookieValue(header: string | undefined, name: string): string | undefin
 }
 
 function setCookie(context: Context<AppEnvironment>, name: string, value: string, production: boolean, httpOnly: boolean, maxAge?: number): void {
-  const parts = [`${name}=${encodeURIComponent(value)}`, 'Path=/', 'SameSite=' + (production ? 'Strict' : 'Lax')];
+  const parts = [`${name}=${encodeURIComponent(value)}`, 'Path=/', 'SameSite=Lax'];
   if (httpOnly) parts.push('HttpOnly');
   if (production) parts.push('Secure');
   if (maxAge !== undefined) parts.push(`Max-Age=${maxAge}`);
@@ -210,7 +241,11 @@ function clearCookies(context: Context<AppEnvironment>, production: boolean): vo
 }
 
 function publicUser(row: UserRow): PublicUser {
-  return { id: row.id, email: row.email, displayName: row.display_name, role: row.role, teamId: row.team_id, createdAt: row.created_at };
+  return {
+    id: row.id, email: row.email, displayName: row.display_name, role: row.role, teamId: row.team_id, createdAt: row.created_at,
+    status: row.disabled_at ? 'disabled' : 'active',
+    ...(row.github_user_id && row.github_login ? { github: { userId: row.github_user_id, login: row.github_login } } : {}),
+  };
 }
 
 function publicProject(row: ProjectRow): PublicProject {
@@ -264,6 +299,10 @@ interface UserRow {
   created_at: string;
   role: AuthenticatedUser['role'];
   team_id: string;
+  disabled_at?: string | null;
+  github_status?: 'active' | 'pending' | 'disabled' | null;
+  github_user_id?: number | null;
+  github_login?: string | null;
 }
 
 interface ProjectRow {
@@ -306,22 +345,10 @@ export function getCurrentUser(context: Context<AppEnvironment>): AuthenticatedU
 }
 
 function loadSessionUser(context: Context<AppEnvironment>, server: ServerContext): AuthenticatedUser | undefined {
-  const token = cookieValue(context.req.header('cookie'), SESSION_COOKIE);
-  if (!token || token.length < 16) return undefined;
-  const now = server.clock.now().toISOString();
-  const row = server.database
-    .prepare(
-      `SELECT u.id, u.email, u.display_name, tm.role, tm.team_id
-       FROM web_sessions ws
-       JOIN users u ON u.id = ws.user_id
-       JOIN team_members tm ON tm.user_id = u.id
-       WHERE ws.token_hash = ? AND ws.revoked_at IS NULL AND ws.expires_at > ? AND u.disabled_at IS NULL
-       ORDER BY tm.created_at LIMIT 1`,
-    )
-    .get(hashToken(token), now) as UserRow | undefined;
-  if (!row) return undefined;
-  server.database.prepare('UPDATE web_sessions SET last_seen_at = ? WHERE token_hash = ? AND revoked_at IS NULL').run(now, hashToken(token));
-  return { id: row.id, email: row.email, displayName: row.display_name, role: row.role, teamId: row.team_id };
+  const session = getSessionAuthentication(server, context.req.header('cookie'));
+  if (!session) return undefined;
+  server.database.prepare('UPDATE web_sessions SET last_seen_at = ? WHERE token_hash = ? AND revoked_at IS NULL').run(server.clock.now().toISOString(), session.tokenHash);
+  return session.user;
 }
 
 export const authMiddleware: MiddlewareHandler<AppEnvironment> = async (context, next) => {
@@ -358,14 +385,7 @@ export const requireProjectAccess: MiddlewareHandler<AppEnvironment> = async (co
     const user = getCurrentUser(context);
     const projectId = context.req.param('projectId') ?? context.req.param('id');
     if (!projectId) throw new HttpError(400, 'project_id_required', 'A project id is required');
-    const project = server.database
-      .prepare(
-        `SELECT p.id FROM projects p
-         JOIN team_members tm ON tm.team_id = p.team_id AND tm.user_id = ?
-         WHERE p.id = ?`,
-      )
-      .get(user.id, projectId) as { id: string } | undefined;
-    if (!project) {
+    if (!canAccessProject(server, user, projectId, !['GET', 'HEAD'].includes(context.req.method))) {
       auditDenied(server, user, 'project.access', 'project', projectId);
       throw new HttpError(404, 'project_not_found', 'Project not found');
     }
@@ -381,13 +401,13 @@ export const requireSessionParticipant: MiddlewareHandler<AppEnvironment> = asyn
     if (!sessionId) throw new HttpError(400, 'session_id_required', 'A session id is required');
     const participant = server.database
       .prepare(
-        `SELECT s.id FROM sessions s
+        `SELECT s.id, s.project_id FROM sessions s
          JOIN team_members tm ON tm.team_id = (SELECT team_id FROM projects WHERE id = s.project_id) AND tm.user_id = ?
          LEFT JOIN session_participants sp ON sp.session_id = s.id AND sp.user_id = ? AND sp.left_at IS NULL
          WHERE s.id = ? AND (sp.user_id IS NOT NULL OR tm.role = 'administrator')`,
       )
-      .get(user.id, user.id, sessionId) as { id: string } | undefined;
-    if (!participant) {
+      .get(user.id, user.id, sessionId) as { id: string; project_id: string } | undefined;
+    if (!participant || !canAccessProject(server, user, participant.project_id, !['GET', 'HEAD'].includes(context.req.method))) {
       auditDenied(server, user, 'session.access', 'session', sessionId);
       throw new HttpError(404, 'session_not_found', 'Session not found');
     }
@@ -435,7 +455,7 @@ async function authorizeMutation(
 }
 
 function responseUser(user: PublicUser): Record<string, unknown> {
-  return { id: user.id, email: user.email, displayName: user.displayName, role: user.role, teamId: user.teamId, createdAt: user.createdAt };
+  return { ...user };
 }
 
 function createdSession(server: ServerContext, userId: string): { token: string; csrfToken: string; expiresAt: string } {
@@ -455,8 +475,10 @@ function createdSession(server: ServerContext, userId: string): { token: string;
 function userByEmail(server: ServerContext, email: string): UserRow | undefined {
   return server.database
     .prepare(
-      `SELECT u.id, u.email, u.display_name, u.password_hash, u.created_at, tm.role, tm.team_id
-       FROM users u JOIN team_members tm ON tm.user_id = u.id WHERE u.email = ? AND u.disabled_at IS NULL ORDER BY tm.created_at LIMIT 1`,
+      `SELECT u.id, u.email, u.display_name, u.password_hash, u.created_at, u.disabled_at, tm.role, tm.team_id,
+         gi.github_user_id, gi.login AS github_login, gi.status AS github_status
+       FROM users u JOIN team_members tm ON tm.user_id = u.id LEFT JOIN github_identities gi ON gi.user_id = u.id
+       WHERE u.email = ? AND u.disabled_at IS NULL ORDER BY tm.created_at LIMIT 1`,
     )
     .get(email) as UserRow | undefined;
 }
@@ -484,12 +506,27 @@ export const coreModule: DholeModule = {
   id: 'core',
   register(app: DholeApp, server: ServerContext): void {
     const limiter = new BoundedRateLimiter();
+    const github = new GithubOAuth(server);
+    const githubEnabled = Boolean(server.config.githubAuth);
+    const bootstrapEnabled = server.config.environment !== 'production' || Boolean(server.config.passwordBootstrapToken);
     // Middleware context is intentionally private to this module.  It lets the
     // exported auth middleware share the exact same DB/clock without global state.
     app.use('*', async (context, next) => {
       serverByContext.set(context, server);
-      const user = loadSessionUser(context, server);
-      if (user) context.set('user', user);
+      const session = getSessionAuthentication(server, context.req.header('cookie'));
+      if (session) {
+        server.database.prepare('UPDATE web_sessions SET last_seen_at = ? WHERE token_hash = ? AND revoked_at IS NULL').run(server.clock.now().toISOString(), session.tokenHash);
+        context.set('user', session.user);
+        if (!PUBLIC_AUTH_MUTATIONS.has(context.req.path) && context.req.path !== '/api/auth/invitation') {
+          const { id, teamId, role } = session.user;
+          context.set('assertAuthorizationCurrent', () => {
+            const current = loadSessionUserByHash(server, session.tokenHash);
+            if (!current || current.id !== id || current.teamId !== teamId || current.role !== role) {
+              throw new HttpError(401, 'authentication_changed', 'Your session changed. Sign in again before retrying');
+            }
+          });
+        }
+      }
       try {
         await next();
       } catch (error) {
@@ -501,10 +538,10 @@ export const coreModule: DholeModule = {
       const method = context.req.method.toUpperCase();
       const path = context.req.path;
       const cookie = context.req.header('cookie') ?? '';
-      const mutating = !['GET', 'HEAD', 'OPTIONS'].includes(method) && path.startsWith('/api/') && !path.startsWith('/api/auth/login') && !path.startsWith('/api/auth/bootstrap');
+      const mutating = !['GET', 'HEAD', 'OPTIONS'].includes(method) && path.startsWith('/api/') && !PUBLIC_AUTH_MUTATIONS.has(path);
       // Session-cookie API clients must prove intent on every mutation. Routes
       // also perform object/role checks; this guard covers modules registered
-      // after Core (Fleet, Runtime, Sessions, ...).
+      // after the Core authentication routes.
       if (mutating && cookie.includes(`${SESSION_COOKIE}=`)) await authorizeMutation(context, server, limiter);
       await next();
     });
@@ -518,12 +555,65 @@ export const coreModule: DholeModule = {
     app.get('/api/health', health);
     app.get('/api/healthz', health);
 
+    app.get('/api/auth/methods', (context) => {
+      context.header('Cache-Control', 'no-store');
+      return json(context, {
+        mode: 'password', password: true, bootstrap: bootstrapEnabled && !server.database.prepare('SELECT id FROM users LIMIT 1').get(),
+        bootstrapTokenRequired: Boolean(server.config.passwordBootstrapToken), github: false, githubLink: githubEnabled,
+      });
+    });
+
+    app.post('/api/auth/github/link', withErrors(async (context) => {
+      if (!githubEnabled) throw new HttpError(404, 'github_disabled', 'GitHub linking is not configured');
+      await authorizeMutation(context, server, limiter);
+      const input = await parseJson(context, CurrentPasswordSchema);
+      const rate = limiter.allow(`github:${requestIp(context)}`, 20, 60_000);
+      if (!rate.allowed) throw new HttpError(429, 'rate_limited', 'Too many authentication attempts');
+      const actor = getCurrentUser(context);
+      const row = userByEmail(server, actor.email);
+      if (!row || !await checkPassword(input.currentPassword, row.password_hash)) throw new HttpError(401, 'invalid_credentials', 'The password is incorrect');
+      const session = getSessionAuthentication(server, context.req.header('cookie'));
+      const current = userByEmail(server, actor.email);
+      if (!session || session.user.id !== actor.id || !current || current.password_hash !== row.password_hash) throw new HttpError(401, 'authentication_required', 'Sign in again to link GitHub');
+      const started = github.start({ userId: actor.id, sessionHash: session.tokenHash });
+      context.header('Cache-Control', 'no-store');
+      context.header('Set-Cookie', `${OAUTH_COOKIE}=${encodeURIComponent(started.browserToken)}; Path=/api/auth/github; HttpOnly; SameSite=Lax; Max-Age=600${server.config.environment === 'production' ? '; Secure' : ''}`, { append: true });
+      return json(context, { authorizeUrl: started.authorizeUrl });
+    }));
+
+    app.get('/api/auth/github/callback', withErrors(async (context) => {
+      if (!githubEnabled) throw new HttpError(404, 'github_disabled', 'GitHub linking is not configured');
+      context.header('Cache-Control', 'no-store');
+      context.header('Referrer-Policy', 'no-referrer');
+      context.header('Set-Cookie', `${OAUTH_COOKIE}=; Path=/api/auth/github; HttpOnly; SameSite=Lax; Max-Age=0${server.config.environment === 'production' ? '; Secure' : ''}`, { append: true });
+      try {
+        const input = GithubCallbackSchema.parse(context.req.query());
+        const session = getSessionAuthentication(server, context.req.header('cookie'));
+        const identity = await github.complete(input.state, cookieValue(context.req.header('cookie'), OAUTH_COOKIE), input.error ? undefined : input.code,
+          session ? { userId: session.user.id, sessionHash: session.tokenHash } : undefined);
+        server.database.transaction(() => {
+          const current = getSessionAuthentication(server, context.req.header('cookie'));
+          if (!current || !session || current.user.id !== session.user.id || current.tokenHash !== session.tokenHash) throw new HttpError(401, 'authentication_required', 'Sign in again to link GitHub');
+          linkGithubIdentity(server, current.user.id, identity);
+          auditAllowed(server, current.user, 'auth.github.link', 'user', current.user.id);
+        })();
+        return context.redirect('/?github=linked');
+      } catch {
+        return context.redirect('/?github=error');
+      }
+    }));
+
     app.post('/api/auth/bootstrap', withErrors(async (context) => {
+      if (server.config.environment === 'production' && !server.config.passwordBootstrapToken) throw new HttpError(404, 'bootstrap_disabled', 'Password bootstrap is disabled');
       requireAuthRequest(context, server);
       const rate = limiter.allow(`bootstrap:${requestIp(context)}`, 5, 60_000);
       if (!rate.allowed) {
         context.header('Retry-After', String(rate.retryAfter));
         throw new HttpError(429, 'rate_limited', 'Too many authentication attempts');
+      }
+      const bootstrapToken = server.config.passwordBootstrapToken;
+      if (bootstrapToken && !tokenMatches(context.req.header('x-dhole-bootstrap-token') ?? '', hashToken(bootstrapToken))) {
+        throw new HttpError(403, 'bootstrap_token_required', 'The operator bootstrap token is required');
       }
       const existing = server.database.prepare('SELECT id FROM users LIMIT 1').get() as { id: string } | undefined;
       if (existing) throw new HttpError(409, 'bootstrap_unavailable', 'An administrator already exists');
@@ -535,38 +625,72 @@ export const coreModule: DholeModule = {
       const session = createdSession(server, userId);
       const row = userByEmail(server, input.email);
       if (!row) throw new Error('Bootstrap user was not created');
-      setCookie(context, SESSION_COOKIE, session.token, server.config.environment === 'production', true);
-      setCookie(context, CSRF_COOKIE, session.csrfToken, server.config.environment === 'production', false);
+      setCookie(context, SESSION_COOKIE, session.token, server.config.environment === 'production', true, SESSION_DAYS * 86_400);
+      setCookie(context, CSRF_COOKIE, session.csrfToken, server.config.environment === 'production', false, SESSION_DAYS * 86_400);
       return json(context, { user: responseUser(publicUser(row)), csrfToken: session.csrfToken, expiresAt: session.expiresAt }, { status: 201 });
     }));
 
     app.post('/api/auth/login', withErrors(async (context) => {
       requireAuthRequest(context, server);
       const input = await parseJson(context, LoginSchema);
-      const rateKey = `login:${requestIp(context)}:${input.email.toLowerCase()}`;
-      const rate = limiter.allow(rateKey, 10, 60_000);
-      if (!rate.allowed) {
-        context.header('Retry-After', String(rate.retryAfter));
+      const accountRate = limiter.allow(`login-account:${input.email.toLowerCase()}`, 10, 60_000);
+      const sourceRate = limiter.allow(`login-source:${requestIp(context)}`, 30, 60_000);
+      if (!accountRate.allowed || !sourceRate.allowed) {
+        context.header('Retry-After', String(Math.max(accountRate.retryAfter, sourceRate.retryAfter)));
         throw new HttpError(429, 'rate_limited', 'Too many authentication attempts');
       }
       const row = userByEmail(server, input.email);
-      const valid = row ? await verifyPassword(input.password, row.password_hash) : false;
+      const valid = await checkPassword(input.password, row?.password_hash ?? DUMMY_PASSWORD_HASH);
       if (!row || !valid) throw new HttpError(401, 'invalid_credentials', 'Invalid email or password');
-      const session = createdSession(server, row.id);
-      setCookie(context, SESSION_COOKIE, session.token, server.config.environment === 'production', true);
-      setCookie(context, CSRF_COOKIE, session.csrfToken, server.config.environment === 'production', false);
-      auditAllowed(server, publicUser(row), 'auth.login', 'user', row.id);
+      const session = server.database.transaction(() => {
+        const current = userByEmail(server, row.email);
+        if (!current || current.password_hash !== row.password_hash) throw new HttpError(401, 'invalid_credentials', 'Invalid email or password');
+        auditAllowed(server, publicUser(current), 'auth.login', 'user', current.id);
+        return createdSession(server, current.id);
+      })();
+      setCookie(context, SESSION_COOKIE, session.token, server.config.environment === 'production', true, SESSION_DAYS * 86_400);
+      setCookie(context, CSRF_COOKIE, session.csrfToken, server.config.environment === 'production', false, SESSION_DAYS * 86_400);
       return json(context, { user: responseUser(publicUser(row)), csrfToken: session.csrfToken, expiresAt: session.expiresAt });
     }));
 
     app.post('/api/auth/logout', withErrors(async (context) => {
       await authorizeMutation(context, server, limiter);
       const token = cookieValue(context.req.header('cookie'), SESSION_COOKIE);
-      if (token) server.database.prepare('UPDATE web_sessions SET revoked_at = ? WHERE token_hash = ? AND revoked_at IS NULL').run(server.clock.now().toISOString(), hashToken(token));
       const user = getCurrentUser(context);
-      auditAllowed(server, user, 'auth.logout', 'user', user.id);
+      server.database.transaction(() => {
+        if (token) server.database.prepare('UPDATE web_sessions SET revoked_at = ? WHERE token_hash = ? AND revoked_at IS NULL').run(server.clock.now().toISOString(), hashToken(token));
+        auditAllowed(server, user, 'auth.logout', 'user', user.id);
+      })();
+      notifySessionAuthorizationChanged(server);
       clearCookies(context, server.config.environment === 'production');
       return json(context, { ok: true });
+    }));
+
+    app.post('/api/auth/password', withErrors(async (context) => {
+      await authorizeMutation(context, server, limiter);
+      const actor = getCurrentUser(context);
+      const input = await parseJson(context, PasswordChangeSchema);
+      const rate = limiter.allow(`password:${actor.id}`, 5, 60_000);
+      if (!rate.allowed) throw new HttpError(429, 'rate_limited', 'Too many authentication attempts');
+      const row = userByEmail(server, actor.email);
+      if (!row || !await checkPassword(input.currentPassword, row.password_hash)) throw new HttpError(401, 'invalid_credentials', 'The password is incorrect');
+      const passwordHash = await hashPassword(input.newPassword);
+      const session = server.database.transaction(() => {
+        const current = getSessionAuthentication(server, context.req.header('cookie'));
+        if (!current || current.user.id !== actor.id || userByEmail(server, actor.email)?.password_hash !== row.password_hash) throw new HttpError(401, 'authentication_required', 'Sign in again to change your password');
+        const now = server.clock.now().toISOString();
+        server.database.prepare('UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?').run(passwordHash, now, actor.id);
+        server.database.prepare('UPDATE web_sessions SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL').run(now, actor.id);
+        server.database.prepare('UPDATE api_tokens SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL').run(now, actor.id);
+        revokeUserDeviceAuthorizations(server, actor.id, actor.id);
+        revokeUserAccountGrants(server, actor.id, actor.id);
+        auditAllowed(server, actor, 'auth.password.change', 'user', actor.id);
+        return createdSession(server, actor.id);
+      }).immediate();
+      notifySessionAuthorizationChanged(server);
+      setCookie(context, SESSION_COOKIE, session.token, server.config.environment === 'production', true, SESSION_DAYS * 86_400);
+      setCookie(context, CSRF_COOKIE, session.csrfToken, server.config.environment === 'production', false, SESSION_DAYS * 86_400);
+      return json(context, { user: responseUser(publicUser(row)), csrfToken: session.csrfToken, expiresAt: session.expiresAt });
     }));
 
     app.get('/api/auth/me', withErrors(async (context) => {
@@ -583,8 +707,10 @@ export const coreModule: DholeModule = {
       const user = getCurrentUser(context);
       const rows = server.database
         .prepare(
-          `SELECT u.id, u.email, u.display_name, u.password_hash, u.created_at, tm.role, tm.team_id
-           FROM users u JOIN team_members tm ON tm.user_id = u.id WHERE tm.team_id = ? ORDER BY u.created_at, u.id`,
+          `SELECT u.id, u.email, u.display_name, u.password_hash, u.created_at, u.disabled_at, tm.role, tm.team_id,
+             gi.github_user_id, gi.login AS github_login, gi.status AS github_status
+           FROM users u JOIN team_members tm ON tm.user_id = u.id LEFT JOIN github_identities gi ON gi.user_id = u.id
+           WHERE tm.team_id = ? ORDER BY u.created_at, u.id`,
         )
         .all(user.teamId) as UserRow[];
       return json(context, { users: rows.map((row) => responseUser(publicUser(row))) });
@@ -594,8 +720,10 @@ export const coreModule: DholeModule = {
       const user = getCurrentUser(context);
       const rows = server.database
         .prepare(
-          `SELECT u.id, u.email, u.display_name, u.password_hash, u.created_at, tm.role, tm.team_id
-           FROM users u JOIN team_members tm ON tm.user_id = u.id WHERE tm.team_id = ? ORDER BY u.created_at, u.id`,
+          `SELECT u.id, u.email, u.display_name, u.password_hash, u.created_at, u.disabled_at, tm.role, tm.team_id,
+             gi.github_user_id, gi.login AS github_login, gi.status AS github_status
+           FROM users u JOIN team_members tm ON tm.user_id = u.id LEFT JOIN github_identities gi ON gi.user_id = u.id
+           WHERE tm.team_id = ? ORDER BY u.created_at, u.id`,
         )
         .all(user.teamId) as UserRow[];
       return json(context, { users: rows.map((row) => responseUser(publicUser(row))) });
@@ -608,18 +736,62 @@ export const coreModule: DholeModule = {
       if (existing) throw new HttpError(409, 'email_in_use', 'A user with that email already exists');
       const now = server.clock.now().toISOString();
       const id = server.ids.id();
-      await hashAndInsertUser(server, input, id, actor.teamId, now, 'Dhole', false);
+      await hashAndInsertUser(server, input, id, actor.teamId, now, 'Dhole', false, false, () => {
+        const active = loadSessionUser(context, server);
+        if (!active || active.id !== actor.id || active.role !== 'administrator' || active.teamId !== actor.teamId) throw new HttpError(403, 'administrator_required', 'Administrator access is required');
+      }, actor.id);
       const row = userByEmail(server, input.email);
       if (!row) throw new Error('User was not created');
-      auditAllowed(server, actor, 'user.create', 'user', id, { role: input.role });
       return json(context, { user: responseUser(publicUser(row)) }, { status: 201 });
     });
     app.post('/api/users', createUser);
     app.post('/api/admin/users', createUser);
 
+    const updateUser = withErrors(async (context) => {
+      await authorizeMutation(context, server, limiter, requireAdmin);
+      const actor = getCurrentUser(context);
+      const userId = context.req.param('userId');
+      if (!userId) throw new HttpError(404, 'user_not_found', 'User not found');
+      const input = await parseJson(context, UserUpdateSchema);
+      server.database.transaction(() => {
+        const activeActor = loadSessionUser(context, server);
+        if (!activeActor || activeActor.id !== actor.id || activeActor.role !== 'administrator') throw new HttpError(403, 'administrator_required', 'Administrator access is required');
+        const current = server.database.prepare(`SELECT u.id, u.disabled_at, tm.role, gi.status AS github_status FROM users u
+          JOIN team_members tm ON tm.user_id = u.id LEFT JOIN github_identities gi ON gi.user_id = u.id
+          WHERE u.id = ? AND tm.team_id = ?`).get(userId, actor.teamId) as UserRow | undefined;
+        if (!current) throw new HttpError(404, 'user_not_found', 'User not found');
+        const removingAdmin = current.role === 'administrator' && !current.disabled_at
+          && (input.status === 'disabled' || input.role === 'member');
+        if (removingAdmin) {
+          const remaining = server.database.prepare(`SELECT count(*) AS count FROM users u JOIN team_members tm ON tm.user_id = u.id
+            WHERE tm.team_id = ? AND tm.role = 'administrator'
+            AND u.disabled_at IS NULL AND u.id <> ?`).get(actor.teamId, userId) as { count: number };
+          if (remaining.count === 0) throw new HttpError(409, 'last_administrator', 'The last active administrator cannot be disabled or demoted');
+        }
+        const now = server.clock.now().toISOString();
+        if (input.status) {
+          server.database.prepare('UPDATE users SET disabled_at = ?, updated_at = ? WHERE id = ?').run(input.status === 'disabled' ? now : null, now, userId);
+          server.database.prepare('UPDATE github_identities SET status = ?, updated_at = ? WHERE user_id = ?').run(input.status, now, userId);
+        }
+        if (input.role) server.database.prepare('UPDATE team_members SET role = ? WHERE user_id = ? AND team_id = ?').run(input.role, userId, actor.teamId);
+        if (input.status === 'disabled' || input.role) {
+          server.database.prepare('UPDATE web_sessions SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL').run(now, userId);
+          server.database.prepare('UPDATE api_tokens SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL').run(now, userId);
+          revokeUserDeviceAuthorizations(server, userId, actor.id);
+          revokeUserAccountGrants(server, userId, actor.id);
+        }
+        auditAllowed(server, actor, 'user.update', 'user', userId, input);
+      }).immediate();
+      notifySessionAuthorizationChanged(server);
+      return json(context, { ok: true });
+    });
+    app.patch('/api/users/:userId', updateUser);
+    app.patch('/api/admin/users/:userId', updateUser);
+
     app.get('/api/projects', withErrors(async (context) => {
       await authMiddleware(context, async () => undefined);
       const user = getCurrentUser(context);
+      const allowedIds = new Set(accessibleProjectIds(server, user));
       const rows = server.database
         .prepare(
           `SELECT p.id, p.team_id, p.name, p.description, p.event_sequence, p.created_by, p.created_at, p.updated_at
@@ -627,7 +799,7 @@ export const coreModule: DholeModule = {
            ORDER BY p.updated_at DESC, p.id`,
         )
         .all(user.id) as ProjectRow[];
-      return json(context, { projects: rows.map(publicProject) });
+      return json(context, { projects: rows.filter((row) => allowedIds.has(row.id)).map(publicProject) });
     }));
 
     app.post('/api/projects', withErrors(async (context) => {
@@ -724,6 +896,8 @@ export const coreModule: DholeModule = {
     });
     app.post('/api/projects/:projectId/repositories', registerRepository);
     app.post('/api/projects/:projectId/repository', registerRepository);
+    registerProjectMembershipRoutes(app, server);
+    registerAccountGrantRoutes(app, server);
   },
 };
 
@@ -736,15 +910,19 @@ async function hashAndInsertUser(
   teamName = 'Dhole',
   createTeam = true,
   requireEmpty = false,
+  authorize?: () => void,
+  actorId?: string,
 ): Promise<void> {
   const passwordHash = await hashPassword(input.password);
   server.database.transaction(() => {
+    authorize?.();
     if (requireEmpty && server.database.prepare('SELECT 1 FROM users LIMIT 1').get()) {
       throw new HttpError(409, 'bootstrap_unavailable', 'An administrator already exists');
     }
     if (createTeam) server.database.prepare('INSERT INTO teams(id, name, created_at) VALUES (?, ?, ?)').run(teamId, teamName, now);
     server.database.prepare('INSERT INTO users(id, email, display_name, password_hash, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)').run(userId, input.email, input.displayName, passwordHash, now, now);
     server.database.prepare('INSERT INTO team_members(team_id, user_id, role, created_at) VALUES (?, ?, ?, ?)').run(teamId, userId, input.role, now);
+    recordAudit(server, { actorType: 'user', actorId: actorId ?? userId, action: requireEmpty ? 'auth.bootstrap' : 'user.create', targetType: 'user', targetId: userId, outcome: 'allowed', detail: { role: input.role } });
   })();
 }
 

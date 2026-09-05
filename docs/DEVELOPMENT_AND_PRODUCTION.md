@@ -1,164 +1,119 @@
-# Development and production operations
+# Development and production
 
-Dhole runs as one central server process plus one outbound `dhole-node` process
-per execution machine. The web build is served by the server; there is no
-container, queue service, database service, or browser-to-node connection.
+Dhole runs one central server with its web build. Execution nodes run on their
+hosts and connect outward. Production packaging uses Podman and optional
+Pangolin Newt. The local fixture workflow needs neither a container nor an
+external service.
 
-## Development loop
+## Local preview
 
-From the repository root, with Node.js 24.15+ and pnpm 10.x:
+Use Node.js `>=24.15 <25` and pnpm 10.x:
 
 ```sh
 pnpm install --frozen-lockfile
-pnpm build
 pnpm dev
 ```
 
-`pnpm dev` rebuilds and starts `apps/server/dist/index.js` on
-`http://127.0.0.1:4173` (override with the `DHOLE_*` server variables). Use
-`pnpm demo` for a complete local graph with a fake node and fixtures. The
-server runs migrations when it opens `DHOLE_DATABASE`; no separate migration
-binary is required.
+`pnpm dev` builds every workspace and starts `apps/server/dist/index.js`.
+Defaults are [http://127.0.0.1:4173](http://127.0.0.1:4173) and
+`./data/dhole.db`. The first-run screen creates an administrator and a session. The bootstrap
+endpoint is `POST /api/auth/bootstrap`; it requires a password of at least 15
+characters. Production bootstrap additionally requires the deployment
+operator's one-time bootstrap secret.
 
-The verification commands are intentionally explicit:
+`pnpm demo` builds and starts a fixture server plus a temporary fake node.
+Its default database is `./data/dhole-demo.db`. Demo mode is rejected in
+production. It includes deterministic records and the demo credentials listed
+in [README](../README.md).
 
-```sh
-pnpm format:check
-pnpm lint
-pnpm typecheck
-pnpm test:run
-pnpm build
-# or run the same gates as one command:
-pnpm verify             # also runs smoke:runtime and smoke:session after the build
-```
-
-Targeted examples:
+Use an unused port and separate database when another server exists. From a
+development shell without production credentials, for example:
 
 ```sh
-pnpm --filter @dhole-control/server test:run src/lib/database.test.ts
-pnpm --filter @dhole-control/server test:run src/modules/gateway/index.test.ts
-pnpm --filter @dhole-control/node test:run src/journal.test.ts
+preview_dir=$(mktemp -d /tmp/dhole-preview.XXXXXX)
+NODE_ENV=development DHOLE_AUTH_MODE=password DHOLE_MODULES=all \
+  DHOLE_HOST=127.0.0.1 DHOLE_PORT=4273 \
+  DHOLE_PUBLIC_ORIGIN=http://127.0.0.1:4273 \
+  DHOLE_ALLOWED_HOSTS=127.0.0.1,localhost \
+  DHOLE_DATABASE="$preview_dir/dhole-demo.db" pnpm demo
 ```
 
-Do not use `docker`, `podman`, `kubectl`, `systemctl`, or a global package
-install as part of the development workflow.
+The demo also creates per-process fake-node state under `data/`. Stop it with
+Ctrl-C. Do not reuse a production database, load a deployment environment,
+initialize live Mediation, or connect an existing machine for preview work.
+The server does not load `.env` itself. Compose reads its deployment `.env`.
 
-## Production configuration and build
+## Module checks
 
-Use a deployment-owned environment (or secret manager) rather than committing
-`.env` files. Production requires a current, matching master key:
+`DHOLE_MODULES=none` starts Core and Access. `all` enables the complete compiled
+set of Coordination, Gateway, and MCP. For example,
+`DHOLE_MODULES=coordination,mcp` adds coordination and its MCP boundary. Core
+sessions, runtime configuration, and machine transport remain available with
+every optional module disabled. Disabled modules contribute no routes, navigation,
+WebSocket handlers, or background work. Migrations still run. See
+[Adding a module](ADDING_A_MODULE.md) for the exact dependency table.
+
+## Verification
 
 ```sh
-export NODE_ENV=production
-export DHOLE_PUBLIC_ORIGIN='https://dhole.example'
-# Optional for forks or versioned deployments; /source otherwise links to Dhole's repository.
-export DHOLE_SOURCE_URL='https://github.com/your-org/dhole/tree/v0.1.0'
-export DHOLE_ALLOWED_HOSTS='dhole.example'
-export DHOLE_MASTER_KEY_ID='v1'
-# DHOLE_MASTER_KEYS is JSON: {"v1":"<base64 for exactly 32 random bytes>"}
-export DHOLE_MASTER_KEYS='{"v1":"..."}'
+pnpm verify
 ```
 
-Generate a key with `openssl rand -base64 32` (or an equivalent approved
-secret generator). Keep key material outside Git, logs, crash reports, and
-shell history. `DHOLE_MASTER_KEYS` may contain old key IDs during a rotation;
-`DHOLE_MASTER_KEY_ID` is used for newly encrypted or rotated provider secrets.
-There is no automatic re-encryption job, so retain an old key until every
-record using it has been deliberately re-encrypted and verified.
+The gate runs `format:check`, `lint`, `typecheck`, `test:run`, `test:clients`,
+`build`, `smoke:runtime`, `smoke:session`, `smoke:onboarding`, and
+`check:deployment`. Focused tests can be run while iterating,
+then the full gate is required before completing a change. Build and tests
+use local fixtures and temporary databases. They do not validate installed
+runtime accounts, spend model quota, or change existing services.
 
-Build and start the single server:
+The [acceptance record](ACCEPTANCE_TRACEABILITY.md) separates historical
+fixture evidence from the current release result. See [MVP status](MVP_STATUS.md)
+for the issue #2 delivery mapping.
 
-```sh
-pnpm install --frozen-lockfile
-NODE_ENV=production pnpm build
-NODE_ENV=production pnpm --filter @dhole-control/server start
-```
+## Production preparation
 
-The compiled server serves `apps/web/dist` at `/` and falls back to the web
-application for client-side routes. Set `DHOLE_DATABASE` to a durable path
-(the default is `./data/dhole.db`, resolved from the working directory). The
-database directory is created with mode `0700`; the database file is tightened
-to mode `0600`.
+Follow [Deployment](DEPLOYMENT.md) for `Containerfile`, `compose.yaml`,
+replacement environment markers, native account bootstrap, optional GitHub
+linking, keys, Newt configuration,
+artifact checks, and backup/restore. The package serves server and web from
+one Dhole container and keeps CPA external. Nodes remain host processes.
+Preparing or validating these files does not start a deployment.
 
-## Reverse proxy and HTTPS/WSS
+Set the public HTTPS origin and matching allowed host. The trusted reverse
+proxy must preserve `Host` and `Origin` and forward WebSocket upgrades for
+`/ws/app` and `/ws/node`, which both belong to Core. Nodes use WSS outside
+loopback. Production cookies are secure; a wrong origin causes authentication
+or CSRF failures rather than a fallback to an unsafe connection.
 
-Terminate TLS at a trusted reverse proxy and forward ordinary HTTP to the
-server's listen address. Configure the externally visible origin, not the
-internal hop:
+Keep master keys outside the image and Git. `DHOLE_MASTER_KEY_ID` selects the
+key for new secret envelopes; retain prior keys while rows still use them.
+The matching SQLite backup and encryption keys are both needed for recovery.
+A prior binary may not understand a later schema, so binary rollback alone is
+not database rollback.
 
-- `DHOLE_PUBLIC_ORIGIN=https://dhole.example`
-- `DHOLE_ALLOWED_HOSTS=dhole.example` (hostnames only; ports are stripped for
-  the host check)
-- `DHOLE_GATEWAY_ALLOWED_HOSTS=...` for explicitly permitted Gateway targets
+## Storage and shutdown
 
-Preserve the `Host` and `Origin` headers. Forward WebSocket upgrades and
-connection headers for both `/ws/app` and `/ws/node`; do not route either path
-to a separate service. The browser chooses `wss://` automatically when loaded
-over HTTPS, and nodes should use `wss://dhole.example/ws/node`. Production
-cookies are `Secure` and `SameSite=Strict`; an incorrect public origin or
-missing upgrade forwarding appears as an origin or WebSocket authentication
-failure.
+SQLite uses WAL, foreign keys, a five-second busy timeout, and
+`synchronous=NORMAL`. Startup applies numbered migrations and verifies their
+stored SHA-256 checksums. Never edit an applied migration. Disabling a module
+does not skip migrations or remove history.
 
-The reverse proxy is part of the trust boundary. Enforce its own request-size,
-access, certificate, and client-IP policies; Dhole still applies host/origin,
-CSRF, object authorization, frame, and payload limits at the application layer.
+For backups and restore, use the stopped-server procedure in
+[Deployment](DEPLOYMENT.md). Preserve database ownership, modes, any WAL
+sidecars belonging to the snapshot, and the referenced encryption keys.
+Validate a restored copy before relying on it.
 
-## SQLite migrations and backups
+On `SIGINT` or `SIGTERM`, the server stops module maintenance and WebSocket
+work, drains the outbox, closes the listener, and closes SQLite. A ten-second
+safety timeout bounds listener shutdown. Stop host node processes separately.
+Their durable journals reconcile incomplete commands when they reconnect.
 
-`openDatabase` enables foreign keys, a 5-second busy timeout, WAL mode, and
-`synchronous=NORMAL`, then applies ordered SQL files from
-`apps/server/migrations`. Each applied migration stores a SHA-256 checksum;
-editing an applied migration causes startup to fail. Migrations are additive
-and the immediately previous schema is covered by a test fixture.
+## Gateway fixtures
 
-For a simple consistent file backup, stop the server first so SQLite has
-checkpointed its WAL, then copy the database and any sidecars as one unit:
-
-```sh
-db_path="${DHOLE_DATABASE:-./data/dhole.db}"
-cp "$db_path" "${db_path}.backup-$(date +%Y%m%d%H%M%S)"
-```
-
-If `-wal` or `-shm` files are present, copy them alongside the database in the
-same stopped-server snapshot; never mix sidecars from different snapshots.
-Restore only while the server is stopped, preserve ownership/mode, and start it
-to run pending migrations. The repository does not ship a live-backup or
-migration-rollback command; validate a backup by opening a copy before relying
-on it.
-
-## CLIProxyAPI fixtures and Gateway
-
-The Gateway accepts an administrator-configured, host-allowlisted management
-URL and encrypts its management secret. A configured connection can be checked
-or synchronized through:
-
-- `POST /api/gateway/connections/:id/health`
-- `POST /api/gateway/connections/:id/sync` (add `?includeUsageQueue=true` when
-  the provider exposes that endpoint)
-- `POST /api/gateway/connections/:id/ingest` for a local JSON or JSONL import
-
-Development, test, and demo builds expose deterministic local fixtures at
-`/api/gateway/fixture` and the `/api/gateway/fixture/v0/management/*` paths.
-The source fixture is `apps/server/src/demo/fake-cliproxy.jsonl`; ingestion
-normalizes records, hashes them for deduplication, redacts sensitive metadata,
-and records exact/approximate correlation. Fixture endpoints return 404 in
-production. Never point a production connection at `fixture.invalid` or put a
-real management secret in a fixture.
-
-## Shutdown and restart
-
-The server handles `SIGINT` and `SIGTERM`: it stops maintenance, flushes the
-event outbox, closes app subscriptions and WebSockets, closes the HTTP server,
-and closes SQLite. A 10-second safety timeout exits if the listener cannot
-drain. Stop the node process separately; when restarted it reconnects outward,
-reports its journal, and reconciles incomplete operation keys. Plan node and
-server restarts together when rotating credentials.
-
-## Operational boundaries
-
-Keep `DHOLE_DATABASE`, node state directories, and repository roots on storage
-with restricted ownership. Do not expose the node WebSocket as a public browser
-API, enable demo mode in production, or send provider credentials in command
-bodies. Live runtime/provider, hardware, and reverse-proxy validation is
-outside the local test suite; see [Acceptance traceability](ACCEPTANCE_TRACEABILITY.md)
-for the exact fixture and external-unverified boundaries.
+Gateway fixture routes and `apps/server/src/demo/fake-cliproxy.jsonl` are
+available only outside production. Import retained JSON/JSONL through
+`POST /api/gateway/connections/:id/ingest`. Health and catalog refresh are
+bounded, allowlisted server requests. No fixture result establishes live CPA
+compatibility or complete upstream usage coverage. See
+[Gateway administration](GATEWAY_AND_CPAMP_REPLACEMENT.md) for supported
+operations and their exact limits.

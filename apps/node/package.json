@@ -14,7 +14,7 @@
     "lint": "tsc -p tsconfig.json --noEmit",
     "start": "node --enable-source-maps dist/index.js",
     "test": "vitest",
-    "test:run": "vitest run --passWithNoTests",
+    "test:run": "vitest run --passWithNoTests --maxWorkers=4 --testTimeout=15000",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {

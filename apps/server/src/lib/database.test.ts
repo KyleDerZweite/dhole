@@ -4,10 +4,11 @@ import { join } from 'node:path';
 import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it } from 'vitest';
 import { systemClock } from './clock.js';
-import { migrateDatabase, openDatabase, type MigrationRecord } from './database.js';
+import { migrateDatabase, openDatabase, readMigrations, type MigrationRecord } from './database.js';
 import { EventStore } from './events.js';
 
 const directories: string[] = [];
+const currentVersion = readMigrations().at(-1)!.version;
 
 afterEach(() => {
   for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true });
@@ -18,22 +19,22 @@ describe('database migrations', () => {
     const directory = mkdtempSync(join(tmpdir(), 'dhole-migrate-'));
     directories.push(directory);
     const database = openDatabase(join(directory, 'dhole.db'), systemClock);
-    expect(database.prepare('SELECT max(version) version FROM schema_migrations').get()).toEqual({ version: 6 });
+    expect(database.prepare('SELECT max(version) version FROM schema_migrations').get()).toEqual({ version: currentVersion });
     expect(database.pragma('foreign_key_check')).toEqual([]);
     database.close();
   });
 
-  it('migrates the immediately previous schema without losing rows', () => {
+  it.each([6, currentVersion - 1])('migrates schema %i without losing rows', (previousVersion) => {
     const directory = mkdtempSync(join(tmpdir(), 'dhole-previous-'));
     directories.push(directory);
     const path = join(directory, 'dhole.db');
-    const previous = openDatabase(path, systemClock, 5);
+    const previous = openDatabase(path, systemClock, previousVersion);
     previous.prepare('INSERT INTO teams(id, name, created_at) VALUES (?, ?, ?)').run('team-1', 'Test', '2026-08-30T00:00:00.000Z');
     previous.close();
     const current = openDatabase(path, systemClock);
     expect(current.prepare('SELECT name FROM teams WHERE id = ?').get('team-1')).toEqual({ name: 'Test' });
     expect(current.prepare("SELECT count(*) count FROM sqlite_master WHERE name = 'memory_generations'").get()).toEqual({ count: 1 });
-    expect(current.prepare('SELECT max(version) version FROM schema_migrations').get()).toEqual({ version: 6 });
+    expect(current.prepare('SELECT max(version) version FROM schema_migrations').get()).toEqual({ version: currentVersion });
     expect(current.prepare("SELECT count(*) count FROM sqlite_master WHERE name = 'coordination_agent_events'").get()).toEqual({ count: 1 });
     current.close();
   });

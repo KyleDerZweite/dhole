@@ -52,19 +52,19 @@ try {
   const setCookies = typeof login.headers.getSetCookie === 'function' ? login.headers.getSetCookie() : [login.headers.get('set-cookie') ?? ''];
   const cookie = setCookies.flatMap((value) => value.split(/,(?=\s*dhole_)/u)).map((value) => value.split(';')[0]).join('; ');
   const authorization = { cookie, 'content-type': 'application/json', 'x-csrf-token': loginBody.csrfToken };
-  const tokenResponse = await fetch(`${origin}/api/fleet/enrollment-tokens`, {
+  const tokenResponse = await fetch(`${origin}/api/machines/enrollment-tokens`, {
     method: 'POST', headers: authorization,
-    body: JSON.stringify({ label: `Demo live node ${process.pid}`, ttlMs: 300_000 }),
+    body: JSON.stringify({ label: `Demo fixture node ${process.pid}`, ttlMs: 300_000 }),
   });
   if (!tokenResponse.ok) throw new Error(`Demo enrollment-token issue failed (${tokenResponse.status})`);
   const enrollment = await tokenResponse.json();
-  const consumeResponse = await fetch(`${origin}/api/fleet/enrollment/consume`, {
+  const consumeResponse = await fetch(`${origin}/api/machines/enrollment/consume`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ token: enrollment.token, machineName: `Demo live node ${process.pid}` }),
+    body: JSON.stringify({ token: enrollment.token, machineName: `Demo fixture node ${process.pid}` }),
   });
   if (!consumeResponse.ok) throw new Error(`Demo enrollment failed (${consumeResponse.status})`);
   const device = await consumeResponse.json();
-  const allowlistResponse = await fetch(`${origin}/api/fleet/machines/${encodeURIComponent(device.machineId)}/allowlist`, {
+  const allowlistResponse = await fetch(`${origin}/api/machines/${encodeURIComponent(device.machineId)}/allowlist`, {
     method: 'POST', headers: authorization,
     body: JSON.stringify({ repositoryId: 'demo-repository', canonicalRoot: root }),
   });
@@ -78,14 +78,14 @@ try {
     DHOLE_NODE_ENABLE_FAKE: 'true',
   });
   await waitFor(async () => {
-    const response = await fetch(`${origin}/api/fleet/machines`, { headers: authorization });
+    const response = await fetch(`${origin}/api/machines`, { headers: authorization });
     if (!response.ok) throw new Error(`Demo machine query failed (${response.status})`);
     const machines = await response.json();
     return Array.isArray(machines) && machines.some((machine) => machine.id === device.machineId && machine.status === 'connected');
   }, 'Demo node did not connect');
 
   const commandId = `demo-discover-${process.pid}-${Date.now()}`;
-  const commandResponse = await fetch(`${origin}/api/fleet/machines/${encodeURIComponent(device.machineId)}/commands`, {
+  const commandResponse = await fetch(`${origin}/api/machines/${encodeURIComponent(device.machineId)}/commands`, {
     method: 'POST', headers: authorization,
     body: JSON.stringify({ command: {
       commandId,
@@ -97,7 +97,7 @@ try {
   });
   if (!commandResponse.ok) throw new Error(`Demo command dispatch failed (${commandResponse.status})`);
   await waitFor(async () => {
-    const response = await fetch(`${origin}/api/fleet/machines/${encodeURIComponent(device.machineId)}/commands`, { headers: authorization });
+    const response = await fetch(`${origin}/api/machines/${encodeURIComponent(device.machineId)}/commands`, { headers: authorization });
     if (!response.ok) throw new Error(`Demo command query failed (${response.status})`);
     const commands = await response.json();
     const command = Array.isArray(commands) ? commands.find((item) => item.id === commandId) : undefined;

@@ -67,7 +67,7 @@ describe('gateway fixture ingestion and boundaries', () => {
       WHEN NEW.action = 'gateway.connection.sync' AND NEW.outcome = 'allowed' BEGIN SELECT RAISE(ABORT, 'audit unavailable'); END`);
     const service = new GatewayService(context, { fetchImpl: async (input) => new Response(input.toString().includes('usage-queue') ? JSON.stringify([{ request_id: 'sync-rollback', provider: 'p', model: 'm' }]) : '{}', { status: 200 }) });
 
-    await expect(service.sync(connectionId, 'team-1', { includeUsageQueue: true }, 'user-1')).rejects.toThrow('audit unavailable');
+    await expect(service.sync(connectionId, 'team-1', { includeUsageQueue: true, acceptDataLoss: true }, 'user-1')).rejects.toThrow('audit unavailable');
     expect(context.database.prepare('SELECT count(*) AS count FROM gateway_requests').get()).toEqual({ count: 0 });
     expect(context.database.prepare('SELECT status FROM gateway_connections WHERE id = ?').get(connectionId)).toEqual({ status: 'unknown' });
   });
@@ -203,6 +203,30 @@ describe('gateway fixture ingestion and boundaries', () => {
     const base = { id: 'x', connectionId: 'c', modelPattern: 'm', effectiveFrom: '2026-01-01T00:00:00.000Z', promptMicrousdPerMillion: 0, completionMicrousdPerMillion: 2_000_000, cacheReadMicrousdPerMillion: null, cacheCreateMicrousdPerMillion: null, contextThresholdTokens: 10, serviceTier: null } as const;
     expect(selectPriceOverride('m', '2026-01-01T00:00:00.000Z', undefined, 10, [base])).toBeUndefined();
     expect(calculateGatewayCostMicrousd({ model: 'm', occurredAt: '2026-01-01T00:00:00.000Z', contextTokens: 11, serviceTier: undefined, inputTokens: 10, outputTokens: 1, cachedTokens: 0, cacheCreationTokens: 0 }, [base])).toBe(2);
+  });
+
+  it('keeps every consumed queue record and requires explicit acknowledgement of upstream data loss', async () => {
+    const { context, connectionId } = setup();
+    const records = Array.from({ length: 101 }, (_, index) => ({ request_id: `queue-${index}`, provider: 'p', model: 'm', usage: { input_tokens: 1 } }));
+    const fetchImpl = vi.fn(async (url: string | URL | Request) => new Response(JSON.stringify(String(url).includes('usage-queue') ? records : {})));
+    const service = new GatewayService(context, { fetchImpl });
+    await expect(service.sync(connectionId, 'team-1', { includeUsageQueue: true })).rejects.toMatchObject({ code: 'gateway_queue_data_loss_consent_required' });
+    expect(fetchImpl).not.toHaveBeenCalled();
+    const result = await service.sync(connectionId, 'team-1', { includeUsageQueue: true, acceptDataLoss: true }, 'user-1');
+    expect(result).toMatchObject({ received: 101, inserted: 101 });
+    expect(service.summary(connectionId).totals.inputTokens).toBe(101);
+  });
+
+  it('validates record objects and preserves single-record usage, timestamps, and unknown prices', () => {
+    const { service, connectionId } = setup();
+    expect(() => service.ingest(connectionId, [null])).toThrow('record objects');
+    expect(() => service.ingest(connectionId, [42])).toThrow('record objects');
+    service.createPriceOverride('team-1', { connectionId, modelPattern: 'm', effectiveFrom: '2026-09-05T14:00:00+02:00', promptMicrousdPerMillion: 1_000_000 }, 'user-1');
+    service.ingest(connectionId, { request_id: 'offset', occurred_at: '2026-09-05T13:00:00.000Z', provider: 'p', model: 'm', usage: { input_tokens: 20 } });
+    service.ingest(connectionId, { request_id: 'unknown', occurred_at: '2026-09-05T13:00:00.000Z', provider: 'p', model: 'other', usage: { input_tokens: 20 } });
+    expect(service.listRequests({ connectionId }).items.find((entry) => entry.requestId === 'offset')).toMatchObject({ model: 'm', inputTokens: 20, estimatedCostMicrousd: 20 });
+    expect(service.listRequests({ connectionId }).items.find((entry) => entry.requestId === 'unknown')?.estimatedCostMicrousd).toBeNull();
+    expect(redactGatewayMetadata({ 'https://upstream.invalid|opaqueCredential': { count: 2 }, remaining: 3 })).toEqual({ remaining: 3 });
   });
 
   it('rejects disallowed hosts and exposes no raw secret in metadata', () => {

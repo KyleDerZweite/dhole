@@ -43,7 +43,7 @@ describe('integrated application', () => {
     const application = createApplication({ config: config(), seed: true });
     applications.push(application);
     const auth = await authenticated(application);
-    const response = await application.app.request('http://127.0.0.1:4173/api/fleet/machines', { headers: { host: '127.0.0.1', cookie: auth.cookie } });
+    const response = await application.app.request('http://127.0.0.1:4173/api/machines', { headers: { host: '127.0.0.1', cookie: auth.cookie } });
     expect(response.status).toBe(200);
     expect((await response.json() as unknown[]).length).toBeGreaterThan(0);
     expect(response.headers.get('x-content-type-options')).toBe('nosniff');

@@ -388,7 +388,7 @@ export class NodeClient {
           const result = await this.executeSessionCommand(command, controller, () => { executionStarted = true; });
           // Bound before persisting. If durable runtime events cannot fit the
           // frame budget, completion must fail into the uncertain state rather
-          // than recording a result Fleet cannot safely replay.
+          // than recording a result the server cannot safely replay.
           const terminalResult = boundedResult(result, commandSecrets);
           const completed = this.journal.complete(command.operationKey, terminalResult);
           this.sendStatus(completed, completed.commandId, commandSecrets);
@@ -490,7 +490,7 @@ export class NodeClient {
         }
         sequence += 1;
         const payload = boundedRecord(Object.fromEntries(Object.entries(event).filter(([key]) => !['type', 'eventId', 'sequence', 'eventKind', 'commandId', 'operationKey'].includes(key))), secret ? [secret] : []);
-        // Operation keys are scoped to a machine in Fleet. Include the
+        // Operation keys are scoped to a machine on the server. Include the
         // command ID so equal keys on two machines cannot collide in the
         // project-level event deduplication index.
         const eventId = `runtime-${createHash('sha256').update(`${command.commandId}:${command.operationKey}:${sequence}`).digest('hex')}:${sequence}`;
