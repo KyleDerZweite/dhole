@@ -1,5 +1,8 @@
 # Roadmap
 
+> Archived project: Dhole is discontinued and no longer maintained. The
+> deferrals below are historical notes, not plans for future releases.
+
 This is the sole ledger for deliberate deferrals. The current delivered scope
 is in [MVP status](docs/MVP_STATUS.md). Issue IDs below refer to the rated
 [issue #2 review](docs/reviews/issue-2.md), which remains historical proposal

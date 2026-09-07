@@ -1,5 +1,8 @@
 # Agent clients
 
+> Archived project: Dhole is discontinued and no longer maintained. These
+> client setup instructions are preserved for reference.
+
 The node binary includes a stdio MCP bridge for Codex, Claude Code, and
 OpenCode. One browser approval stores machine authorization locally. Each
 agent process then gets a short-lived project token and its own coordination

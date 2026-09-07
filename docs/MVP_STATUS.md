@@ -1,5 +1,8 @@
 # MVP status
 
+> Archived project: Dhole is discontinued and no longer maintained. This
+> document records the final implementation status for historical reference.
+
 This records the 2026-09-05 implementation, not a deployment. The repository
 contains a native-account server with closed invitations and offline sole-admin
 recovery, revocable machine authorization, a local

@@ -1,5 +1,15 @@
 # Dhole
 
+## Public archive
+
+Dhole is discontinued. This repository is a public archive for reference
+and is no longer maintained. No further releases, bug fixes, or security
+updates are planned, and issues and pull requests are no longer accepted.
+
+I am replacing Dhole with another self-hosted solution. The documentation
+below describes the final archived code and remains available for anyone
+who wants to inspect or fork it.
+
 Dhole is a self-hosted server for shared agent work and CPA administration.
 Sign in, authorize a machine, and let its agents use scoped project access.
 Core includes the master overview, conversations, agent activity, runtimes,
